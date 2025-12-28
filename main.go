@@ -252,8 +252,6 @@ func main() {
 
 						if _, err := bot.Send(poll); err != nil {
 							msg.Text = "🚫 Ошибка создания poll: " + err.Error()
-						} else {
-							msg.Text = "📊 Poll создан! Голосование активно."
 						}
 					}
 
