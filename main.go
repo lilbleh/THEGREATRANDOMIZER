@@ -298,7 +298,7 @@ func main() {
 						for i, participant := range participants {
 							username := participantIDs[participant]
 							if username != "" {
-								msg.Text += fmt.Sprintf("\n%d. %s (@%s)", i+1, participant, username)
+								msg.Text += fmt.Sprintf("\n%d. %s", i+1, participant)
 							} else {
 								msg.Text += fmt.Sprintf("\n%d. %s", i+1, participant)
 							}
