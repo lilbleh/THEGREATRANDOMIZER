@@ -168,20 +168,26 @@ func main() {
 					// Получаем аргументы команды
 					args := update.Message.CommandArguments()
 					if args == "" {
-						msg.Text = "🚫 Укажите имя и username! Пример: /add Иван Иванов ivan_username"
+						msg.Text = "🚫 Укажите имя, фамилию и username! Пример: /add Иван Иванов ivan_username"
 					} else {
-						parts := strings.SplitN(args, " ", 2)
-						if len(parts) < 2 {
-							msg.Text = "🚫 Укажите имя и username через пробел! Пример: /add Иван Иванов ivan_username"
+						parts := strings.Split(args, " ")
+						if len(parts) < 3 {
+							msg.Text = "🚫 Укажите имя, фамилию и username через пробел! Пример: /add Иван Иванов ivan_username"
 						} else {
-							name := strings.TrimSpace(parts[0])
-							username := strings.TrimSpace(parts[1])
+							firstName := strings.TrimSpace(parts[0])
+							lastName := strings.TrimSpace(parts[1])
+							username := strings.TrimSpace(parts[2])
 
-							if name == "" || username == "" {
-								msg.Text = "🚫 Имя и username не могут быть пустыми!"
+							if firstName == "" || lastName == "" || username == "" {
+								msg.Text = "🚫 Имя, фамилия и username не могут быть пустыми!"
 							} else {
-								participantIDs[name] = username
-								msg.Text = fmt.Sprintf("✅ Участник %s (@%s) добавлен в основной список!\nТеперь в списке %d участников.", name, username, len(participantIDs))
+								fullName := firstName + " " + lastName
+								participantIDs[fullName] = username
+								// Также добавляем в текущий активный список, если он не пустой
+								if len(participants) > 0 {
+									participants = append(participants, fullName)
+								}
+								msg.Text = fmt.Sprintf("✅ Участник %s (@%s) добавлен в основной список!\nТеперь в списке %d участников.", fullName, username, len(participantIDs))
 							}
 						}
 					}
