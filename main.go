@@ -1,11 +1,12 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/big"
+	"strconv"
 	"strings"
-	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -42,11 +43,39 @@ var participantIDs = map[string]string{
 	"Алексей Баранов":     "barrrraaa",
 }
 
-// Функция для перемешивания слайса
+// Функция для перемешивания слайса с использованием crypto/rand
 func shuffleParticipants() {
-	rand.Shuffle(len(participants), func(i, j int) {
+	for i := len(participants) - 1; i > 0; i-- {
+		randomIndex, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		j := int(randomIndex.Int64())
 		participants[i], participants[j] = participants[j], participants[i]
-	})
+	}
+}
+
+func promoteUserToAdmin(bot *tgbotapi.BotAPI, chatID int64, userID int64) {
+	promoteConfig := tgbotapi.PromoteChatMemberConfig{
+		ChatMemberConfig: tgbotapi.ChatMemberConfig{
+			ChatID: chatID,
+			UserID: userID,
+		},
+		CanChangeInfo:      false,
+		CanManageChat:      false,
+		CanEditMessages:    false,
+		CanDeleteMessages:  false,
+		CanInviteUsers:     false,
+		CanRestrictMembers: false,
+		CanPinMessages:     false,
+		CanPromoteMembers:  false,
+	}
+
+	_, err := bot.Request(promoteConfig)
+
+	if err != nil {
+		log.Printf("Ошибка при повышении пользователя %d до администратора: %v", userID, err)
+
+	} else {
+		log.Printf("Пользователь %d успешно повышен до администратора", userID)
+	}
 }
 
 func main() {
@@ -59,8 +88,7 @@ func main() {
 		log.Panic(err)
 	}
 
-	// Устанавливаем время для генерации случайных чисел
-	rand.Seed(time.Now().UnixNano())
+	// crypto/rand не нуждается в инициализации seed
 
 	// Инициализируем список участников из основного списка
 	participants = make([]string, 0, len(participantIDs))
@@ -104,7 +132,8 @@ func main() {
 						msg.Text = "Игра уже окончена!"
 					} else if len(participants) == 2 {
 						// Финальный раунд: случайный выбор победителя
-						winnerIndex := rand.Intn(2)
+						randomIndex, _ := rand.Int(rand.Reader, big.NewInt(2))
+						winnerIndex := int(randomIndex.Int64())
 						winner := participants[winnerIndex]
 						loser := participants[1-winnerIndex]
 
@@ -126,7 +155,8 @@ func main() {
 						msg.Text = finalText
 					} else {
 						// Обычный раунд: выбираем случайного участника для удаления
-						loserIndex := rand.Intn(len(participants))
+						randomIndex, _ := rand.Int(rand.Reader, big.NewInt(int64(len(participants))))
+						loserIndex := int(randomIndex.Int64())
 						removedParticipant := participants[loserIndex]
 
 						// Удаляем участника из списка
@@ -315,6 +345,19 @@ func main() {
 						"/poll - голосование\n" +
 						"/debug - отладочная информация\n" +
 						"это все что тебе надо"
+				case "promote":
+					args := update.Message.CommandArguments()
+					if args == "" {
+						msg.Text = "🚫 Укажите ID пользователя для повышения до администратора! Пример: /promote 123456789"
+					} else {
+						userID, err := strconv.ParseInt(strings.TrimSpace(args), 10, 64)
+						if err != nil {
+							msg.Text = "🚫 Неверный формат ID пользователя! Используйте числовой ID."
+						} else {
+							promoteUserToAdmin(bot, update.Message.Chat.ID, userID)
+							msg.Text = "✅ Попытка повышения пользователя до администратора выполнена."
+						}
+					}
 
 				default:
 					msg.Text = "ты долбоеб? не знаешь команд? пиши /help"
