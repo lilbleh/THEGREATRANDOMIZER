@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  # Redis сервис
+  redis:
+    image: redis:7-alpine
+    container_name: tg-random-bot-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - tg-random-network
+
+  # Приложение бота
+  app:
+    build: .
+    container_name: tg-random-bot-app
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      - REDIS_ADDR=redis:6379
+    networks:
+      - tg-random-network
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  tg-random-network:
+    driver: bridge

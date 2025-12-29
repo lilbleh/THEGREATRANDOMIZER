@@ -1,0 +1,25 @@
+# Git
+.git
+.gitignore
+
+# Логи
+*.log
+bot.log
+
+# Исполняемые файлы
+tg-random-bot
+
+# IDE файлы
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS файлы
+.DS_Store
+Thumbs.db
+
+# Docker файлы (не копируем сами в себя)
+Dockerfile
+docker-compose.yml
+.dockerignore
