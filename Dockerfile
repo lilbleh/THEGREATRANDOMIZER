@@ -7,6 +7,9 @@ WORKDIR /app
 # Копируем go.mod и go.sum для загрузки зависимостей
 COPY go.mod go.sum ./
 
+# Копируем локальный модуль gamble (нужен для replace директивы)
+COPY gamble/ ./gamble/
+
 # Загружаем зависимости
 RUN go mod download
 

@@ -50,3 +50,48 @@ func GenerateRandomNumber() int {
 	}
 	return int(randomBig.Int64())
 }
+
+// CoinResult представляет результат броска монеты
+type CoinResult string
+
+const (
+	Heads CoinResult = "1" // орел, 49% шанс
+	Tails CoinResult = "2" // решка, 49% шанс
+	Edge  CoinResult = "3" // ребро, 2% шанс
+)
+
+// TossCoin бросает монету с заданными вероятностями:
+// - 1 (орел): 49% (0-48)
+// - 2 (решка): 49% (49-97)
+// - 3 (ребро): 2% (98-99)
+func TossCoin() CoinResult {
+	// Генерируем число от 0 до 99 (100 вариантов)
+	max := big.NewInt(100)
+	randomBig, err := rand.Int(rand.Reader, max)
+	if err != nil {
+		return Tails // fallback
+	}
+
+	randomNum := int(randomBig.Int64())
+
+	switch {
+	case randomNum <= 48: // 49% (0-48)
+		return Heads
+	case randomNum <= 97: // 49% (49-97)
+		return Tails
+	default: // 2% (98-99)
+		return Edge
+	}
+}
+
+// GetCoinMultiplier возвращает коэффициент выплаты для результата монеты
+func GetCoinMultiplier(result CoinResult) int {
+	switch result {
+	case Tails, Heads:
+		return 2
+	case Edge:
+		return 100
+	default:
+		return 1
+	}
+}

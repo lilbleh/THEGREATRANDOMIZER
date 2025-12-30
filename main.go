@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"tg-random-bot/gamble"
+
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/redis/go-redis/v9"
 )
@@ -142,6 +144,7 @@ var eliminatedParticipants []string // Выбывшие участники
 
 // Map для хранения балансов игроков (ключ: username, значение: баланс)
 var playerBalances = make(map[string]int)
+var playerBanks = make(map[string]int)
 
 // Redis клиент для персистентного хранения балансов
 var redisClient *redis.Client
@@ -238,6 +241,34 @@ func getChipsWord(count int) string {
 		return "фишки"
 	default:
 		return "фишек"
+	}
+}
+
+// Функция для правильного склонения результатов броска монеты
+func getCoinResultText(result gamble.CoinResult) string {
+	switch result {
+	case gamble.Heads:
+		return "выпал орел (1)"
+	case gamble.Tails:
+		return "выпала решка (2)"
+	case gamble.Edge:
+		return "выпало ребро (3)"
+	default:
+		return fmt.Sprintf("выпала %s", result)
+	}
+}
+
+// Функция для преобразования цифры монеты в название
+func getCoinSideName(side string) string {
+	switch side {
+	case "1":
+		return "1 (орел)"
+	case "2":
+		return "2 (решка)"
+	case "3":
+		return "3 (ребро)"
+	default:
+		return side
 	}
 }
 
@@ -969,6 +1000,70 @@ func loadAllBalancesFromRedis() {
 	log.Printf("Загружено %d балансов из Redis", len(playerBalances))
 }
 
+// Функция для сохранения банковских счетов в Redis
+func saveBanksToRedis() error {
+	if redisClient == nil {
+		return fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	for username, bank := range playerBanks {
+		key := fmt.Sprintf("bank:%s", username)
+		err := redisClient.Set(ctx, key, bank, 0).Err()
+		if err != nil {
+			log.Printf("Ошибка сохранения банка для %s: %v", username, err)
+			return fmt.Errorf("failed to save bank for %s: %v", username, err)
+		}
+	}
+
+	log.Printf("saveBanksToRedis: Сохранено %d банковских счетов в Redis", len(playerBanks))
+	return nil
+}
+
+// Функция для загрузки банковского счета из Redis
+func loadBankFromRedis(username string) (int, bool) {
+	if redisClient == nil {
+		return 0, false
+	}
+
+	ctx := context.Background()
+	key := fmt.Sprintf("bank:%s", username)
+	val, err := redisClient.Get(ctx, key).Result()
+	if err != nil {
+		return 0, false
+	}
+
+	bank, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, false
+	}
+
+	return bank, true
+}
+
+// Функция для загрузки всех банковских счетов из Redis
+func loadAllBanksFromRedis() {
+	if redisClient == nil {
+		return
+	}
+
+	ctx := context.Background()
+	keys, err := redisClient.Keys(ctx, "bank:*").Result()
+	if err != nil {
+		log.Printf("Ошибка загрузки банковских счетов из Redis: %v", err)
+		return
+	}
+
+	for _, key := range keys {
+		username := strings.TrimPrefix(key, "bank:")
+		if bank, ok := loadBankFromRedis(username); ok {
+			playerBanks[username] = bank
+		}
+	}
+
+	log.Printf("Загружено %d банковских счетов из Redis", len(playerBanks))
+}
+
 // Функция для сохранения количества туров в Redis
 func saveTotalRoundsToRedis(rounds int) {
 	if redisClient == nil {
@@ -1371,10 +1466,22 @@ func changeBalance(username string, amount int) bool {
 	return true
 }
 
+// Функция для проверки доступа пользователя к боту
+func isUserAllowed(username string) bool {
+	// Проверяем, есть ли пользователь в списке участников
+	for _, uname := range participantIDs {
+		if uname == username {
+			return true
+		}
+	}
+	return false
+}
+
 // Функция для инициализации балансов участников
 func initializeBalances() {
 	// Сначала пытаемся загрузить существующие балансы из Redis
 	loadAllBalancesFromRedis()
+	loadAllBanksFromRedis()
 
 	// Для новых участников, у которых нет баланса, устанавливаем начальный баланс
 	for _, username := range participantIDs {
@@ -1492,6 +1599,16 @@ func main() {
 				log.Printf("Обработка команды: %s от %s", update.Message.Command(), update.Message.From.UserName)
 				// Проверяем доступ пользователя - теперь проверка идет внутри команд
 				userName := update.Message.From.UserName
+
+				// Проверяем, имеет ли пользователь доступ к боту
+				if !isUserAllowed(userName) {
+					msg := tgbotapi.NewMessage(update.Message.Chat.ID, "🚫 Вам было отказано в пользовании ботом. 🤷‍♂️\n\nВас нет в списке участников. Обратитесь к администрации за подробностями. 📞\n\n")
+					msg.ReplyToMessageID = update.Message.MessageID
+					if _, err := bot.Send(msg); err != nil {
+						log.Printf("Ошибка отправки сообщения об отказе в доступе: %v", err)
+					}
+					continue // Пропускаем дальнейшую обработку
+				}
 
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "")
 
@@ -2139,7 +2256,10 @@ func main() {
 							playerBalances[userName] = 0 // Исправляем отрицательный баланс
 							balance = 0
 						}
-						msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("💰 Ваш баланс: %d %s", balance, getChipsWord(balance)))
+						bankBalance := playerBanks[userName] // 0 если не существует
+						totalBalance := balance + bankBalance
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("💰 Ваш баланс: %d %s\n🏦 В банке: %d %s\n💵 Итого: %d %s",
+							balance, getChipsWord(balance), bankBalance, getChipsWord(bankBalance), totalBalance, getChipsWord(totalBalance)))
 						msg.ReplyToMessageID = update.Message.MessageID
 						if _, err := bot.Send(msg); err != nil {
 							log.Panic(err)
@@ -2152,6 +2272,103 @@ func main() {
 						}
 					}
 					continue // Пропускаем стандартную отправку сообщения
+
+				case "bank":
+					userName := update.Message.From.UserName
+					args := update.Message.CommandArguments()
+
+					if args == "" {
+						// Показать справку по банку
+						bankBalance := playerBanks[userName] // 0 если не существует
+						msg.Text = fmt.Sprintf("🏦 БАНК - безопасное хранение фишек!\n\n💰 На счету: %d %s\n💵 На руках: %d %s\n\n📋 Команды:\n• /bank add 1000 - положить 1000 фишек в банк\n• /bank get 500 - снять 500 фишек из банка\n\n⚠️ Фишки в банке нельзя тратить на ставки!",
+							bankBalance, getChipsWord(bankBalance), playerBalances[userName], getChipsWord(playerBalances[userName]))
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					parts := strings.Split(args, " ")
+					if len(parts) < 2 {
+						msg.Text = "🏦 Укажите операцию и сумму!\nПримеры:\n• /bank add 1000\n• /bank get 500"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					operation := strings.ToLower(strings.TrimSpace(parts[0]))
+					amountStr := strings.TrimSpace(parts[1])
+
+					amount, err := strconv.Atoi(amountStr)
+					if err != nil || amount <= 0 {
+						msg.Text = "🏦 Укажите корректную положительную сумму!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					if operation == "add" {
+						// Положить деньги в банк
+						if playerBalances[userName] < amount {
+							msg.Text = fmt.Sprintf("🏦 Недостаточно средств на руках!\n💵 У вас: %d %s",
+								playerBalances[userName], getChipsWord(playerBalances[userName]))
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+
+						// Списываем с баланса
+						changeBalance(userName, -amount)
+						// Добавляем в банк
+						playerBanks[userName] += amount
+
+						// Сохраняем в Redis
+						if err := saveBanksToRedis(); err != nil {
+							log.Printf("Ошибка сохранения банковских счетов: %v", err)
+							// Возвращаем фишки обратно в случае ошибки
+							changeBalance(userName, amount)
+							playerBanks[userName] -= amount
+							msg.Text = "🏦 Ошибка сохранения! Попробуйте позже."
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+
+						msg.Text = fmt.Sprintf("🏦 ✅ Успешно положено %d %s в банк!\n\n💰 На счету: %d %s\n💵 На руках: %d %s",
+							amount, getChipsWord(amount),
+							playerBanks[userName], getChipsWord(playerBanks[userName]),
+							playerBalances[userName], getChipsWord(playerBalances[userName]))
+						msg.ReplyToMessageID = update.Message.MessageID
+
+					} else if operation == "get" {
+						// Снять деньги из банка
+						if playerBanks[userName] < amount {
+							msg.Text = fmt.Sprintf("🏦 Недостаточно средств в банке!\n💰 На счету: %d %s",
+								playerBanks[userName], getChipsWord(playerBanks[userName]))
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+
+						// Списываем из банка
+						playerBanks[userName] -= amount
+						// Добавляем на баланс
+						changeBalance(userName, amount)
+
+						// Сохраняем в Redis
+						if err := saveBanksToRedis(); err != nil {
+							log.Printf("Ошибка сохранения банковских счетов: %v", err)
+							// Возвращаем фишки обратно в случае ошибки
+							playerBanks[userName] += amount
+							changeBalance(userName, -amount)
+							msg.Text = "🏦 Ошибка сохранения! Попробуйте позже."
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+
+						msg.Text = fmt.Sprintf("🏦 ✅ Успешно снято %d %s из банка!\n\n💰 На счету: %d %s\n💵 На руках: %d %s",
+							amount, getChipsWord(amount),
+							playerBanks[userName], getChipsWord(playerBanks[userName]),
+							playerBalances[userName], getChipsWord(playerBalances[userName]))
+						msg.ReplyToMessageID = update.Message.MessageID
+
+					} else {
+						msg.Text = "🏦 Неизвестная операция!\nИспользуйте: add или get"
+						msg.ReplyToMessageID = update.Message.MessageID
+					}
 
 				case "givefunds":
 					// Проверяем, является ли пользователь администратором
@@ -2283,6 +2500,117 @@ func main() {
 					log.Printf("Команда /pay: %s перевел %d фишек пользователю %s", userName, amount, recipientUsername)
 					msg.Text = fmt.Sprintf("✅ Успешно переведено %d %s пользователю @%s!\n💰 Ваш баланс: %d %s",
 						amount, getChipsWord(amount), recipientUsername, playerBalances[userName], getChipsWord(playerBalances[userName]))
+					msg.ReplyToMessageID = update.Message.MessageID
+
+				case "coin":
+					log.Printf("🪙 Команда /coin от %s", userName)
+					args := update.Message.CommandArguments()
+					if args == "" {
+						msg.Text = "🪙 Бросок монеты!\n\n🎯 Выберите сторону и ставку:\n/coin 1 100 (орел)\n/coin 2 100 (решка)\n/coin 3 100 (ребро)\n/coin 1 all (ВСЁ ИЛИ НИЧЕГО! 🔥)\n\n📊 Шансы:\n• Орел/Решка: x2 (49% каждый)\n• Ребро: x100 (2%)"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					parts := strings.Split(args, " ")
+					if len(parts) < 2 {
+						msg.Text = "🪙 Укажите сторону и ставку!\nПример: /coin 1 100 или /coin 1 all (1=орел, 2=решка, 3=ребро)"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					coinSide := strings.ToLower(strings.TrimSpace(parts[0]))
+					betAmountStr := strings.TrimSpace(parts[1])
+
+					// Проверяем корректность стороны монеты
+					if coinSide != "1" && coinSide != "2" && coinSide != "3" {
+						msg.Text = "🪙 Некорректная сторона монеты!\n\n🎯 Доступные варианты:\n• 1 (орел)\n• 2 (решка)\n• 3 (ребро)"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Парсим ставку
+					var betAmount int
+					var isAllIn bool
+
+					if strings.ToLower(betAmountStr) == "all" {
+						// Ставка на весь баланс!
+						userBalance, exists := playerBalances[userName]
+						if !exists || userBalance <= 0 {
+							msg.Text = "🪙 У вас нет фишек для ставки!\n💰 Ваш баланс: 0 фишек"
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+						betAmount = userBalance
+						isAllIn = true
+					} else {
+						var err error
+						betAmount, err = strconv.Atoi(betAmountStr)
+						if err != nil || betAmount <= 0 {
+							msg.Text = "🪙 Некорректная сумма ставки!\nПример: /coin 1 100 или /coin 1 all (1=орел, 2=решка, 3=ребро)"
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+						isAllIn = false
+					}
+
+					// Проверяем баланс
+					userBalance, exists := playerBalances[userName]
+					if !exists || userBalance < betAmount {
+						msg.Text = fmt.Sprintf("🪙 Недостаточно средств!\n💰 Ваш баланс: %d %s",
+							userBalance, getChipsWord(userBalance))
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Снимаем ставку сразу
+					changeBalance(userName, -betAmount)
+
+					// Делаем бросок монеты
+					result := gamble.TossCoin()
+					multiplier := gamble.GetCoinMultiplier(result)
+
+					log.Printf("🪙 Бросок монеты: игрок %s поставил на %s %d фишек, выпало %s (x%d)",
+						userName, coinSide, betAmount, result, multiplier)
+
+					// Определяем результат ставки
+					var winAmount int
+					var resultEmoji string
+					var resultText string
+
+					if result == gamble.CoinResult(coinSide) {
+						// Выигрыш! Возвращаем ставку + выигрыш
+						winAmount = betAmount * multiplier
+						changeBalance(userName, winAmount)
+						resultEmoji = "🎉"
+						if isAllIn {
+							resultText = fmt.Sprintf("💥 МЕГА-ВЫИГРЫШ! %s!\n💰 +%d %s (x%d)\n🔥 ВСЁ ИЛИ НИЧЕГО! 🔥",
+								getCoinResultText(result), winAmount, getChipsWord(winAmount), multiplier)
+						} else {
+							resultText = fmt.Sprintf("✅ ВЫИГРЫШ! %s!\n💰 +%d %s (x%d)",
+								getCoinResultText(result), winAmount, getChipsWord(winAmount), multiplier)
+						}
+					} else {
+						// Проигрыш (ставка уже снята)
+						resultEmoji = "😞"
+						if isAllIn {
+							resultText = fmt.Sprintf("💀 КАТАСТРОФИЧЕСКИЙ ПРОИГРЫШ! %s!\n💰 -%d %s\n😵 ВСЁ ПРОИГРАНО! ВСЁ!",
+								getCoinResultText(result), betAmount, getChipsWord(betAmount))
+						} else {
+							resultText = fmt.Sprintf("❌ ПРОИГРЫШ! %s!\n💰 -%d %s",
+								getCoinResultText(result), betAmount, getChipsWord(betAmount))
+						}
+					}
+
+					var headerText string
+					if isAllIn {
+						headerText = "🪙 ВСЁ ИЛИ НИЧЕГО! 🔥\n\n🎯 Вы поставили ВСЁ на: %s\n💰 Ставка: %d %s\n\n%s %s\n\n💰 Ваш баланс: %d %s"
+					} else {
+						headerText = "🪙 Бросок монеты!\n\n🎯 Вы поставили на: %s\n💰 Ставка: %d %s\n\n%s %s\n\n💰 Ваш баланс: %d %s"
+					}
+
+					msg.Text = fmt.Sprintf(headerText,
+						getCoinSideName(coinSide), betAmount, getChipsWord(betAmount),
+						resultEmoji, resultText, playerBalances[userName], getChipsWord(playerBalances[userName]))
 					msg.ReplyToMessageID = update.Message.MessageID
 
 				case "debug":
@@ -2554,13 +2882,17 @@ func main() {
 						"/leaderboard - доска лидеров по стоимости инвентаря\n\n" +
 						"💰 ЭКОНОМИКА:\n" +
 						"/balance - посмотреть свой баланс\n" +
+						"/bank - управление банковским счетом\n" +
+						"/bank add (сумма) - положить фишки в банк\n" +
+						"/bank get (сумма) - снять фишки из банка\n" +
 						"/inv - посмотреть свой инвентарь плашек\n" +
 						"/sell (хэш) - продать плашку\n" +
 						"/wear (хэш) - надеть плашку\n" +
 						"/unwear - снять плашку\n" +
 						"/pay (@username сумма) - перевести фишки другому игроку\n" +
 						"/bet (номер сумма) - сделать ставку на участника\n" +
-						"/bet (номер all) - поставить все деньги\n\n" +
+						"/bet (номер all) - поставить все деньги\n" +
+						"/coin (1/2/3 сумма/all) - бросок монеты (1=орел, 2=решка, 3=ребро, all=весь баланс)\n\n" +
 						"👑 АДМИНИСТРАТОРСКИЕ КОМАНДЫ:\n" +
 						"/add (Имя Фамилия username) - добавить участника\n" +
 						"/remove (Имя Фамилия) - удалить участника\n" +
