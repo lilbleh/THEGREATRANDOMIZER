@@ -145,6 +145,8 @@ var eliminatedParticipants []string // Выбывшие участники
 // Map для хранения балансов игроков (ключ: username, значение: баланс)
 var playerBalances = make(map[string]int)
 var playerBanks = make(map[string]int)
+var playerFines = make(map[string]int)           // Штрафы за ограбления (ключ: username, значение: сумма штрафа)
+var playerFineDates = make(map[string]time.Time) // Дата последнего обновления штрафа
 
 // Redis клиент для персистентного хранения балансов
 var redisClient *redis.Client
@@ -1064,6 +1066,105 @@ func loadAllBanksFromRedis() {
 	log.Printf("Загружено %d банковских счетов из Redis", len(playerBanks))
 }
 
+// Функция для сохранения штрафов в Redis
+func saveFinesToRedis() error {
+	if redisClient == nil {
+		return fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	for username, fine := range playerFines {
+		key := fmt.Sprintf("fine:%s", username)
+		err := redisClient.Set(ctx, key, fine, 0).Err()
+		if err != nil {
+			log.Printf("Ошибка сохранения штрафа для %s: %v", username, err)
+			return fmt.Errorf("failed to save fine for %s: %v", username, err)
+		}
+	}
+
+	log.Printf("saveFinesToRedis: Сохранено %d штрафов в Redis", len(playerFines))
+	return nil
+}
+
+// Функция для загрузки штрафа из Redis
+func loadFineFromRedis(username string) (int, bool) {
+	if redisClient == nil {
+		return 0, false
+	}
+
+	ctx := context.Background()
+	key := fmt.Sprintf("fine:%s", username)
+	val, err := redisClient.Get(ctx, key).Result()
+	if err != nil {
+		return 0, false
+	}
+
+	fine, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, false
+	}
+
+	return fine, true
+}
+
+// Функция для загрузки всех штрафов из Redis
+func loadAllFinesFromRedis() {
+	if redisClient == nil {
+		return
+	}
+
+	ctx := context.Background()
+	keys, err := redisClient.Keys(ctx, "fine:*").Result()
+	if err != nil {
+		log.Printf("Ошибка загрузки штрафов из Redis: %v", err)
+		return
+	}
+
+	for _, key := range keys {
+		username := strings.TrimPrefix(key, "fine:")
+		if fine, ok := loadFineFromRedis(username); ok {
+			playerFines[username] = fine
+			// Устанавливаем дату последнего обновления на текущую
+			playerFineDates[username] = time.Now()
+		}
+	}
+
+	log.Printf("Загружено %d штрафов из Redis", len(playerFines))
+}
+
+// Функция для ежедневного увеличения штрафов
+func updateFinesDaily() {
+	now := time.Now()
+	for username, fine := range playerFines {
+		if fine <= 0 {
+			continue
+		}
+
+		lastUpdate, exists := playerFineDates[username]
+		if !exists {
+			playerFineDates[username] = now
+			continue
+		}
+
+		// Проверяем, прошли ли сутки
+		daysSinceUpdate := int(now.Sub(lastUpdate).Hours() / 24)
+		if daysSinceUpdate > 0 {
+			// Увеличиваем штраф на 10% за каждый день
+			for i := 0; i < daysSinceUpdate; i++ {
+				fine = int(float64(fine) * 1.1) // Увеличение на 10%
+			}
+			playerFines[username] = fine
+			playerFineDates[username] = now
+			log.Printf("Штраф игрока %s увеличен до %d (прошло %d дней)", username, fine, daysSinceUpdate)
+		}
+	}
+
+	// Сохраняем обновленные штрафы
+	if err := saveFinesToRedis(); err != nil {
+		log.Printf("Ошибка сохранения обновленных штрафов: %v", err)
+	}
+}
+
 // Функция для сохранения количества туров в Redis
 func saveTotalRoundsToRedis(rounds int) {
 	if redisClient == nil {
@@ -1475,6 +1576,144 @@ func isUserAllowed(username string) bool {
 		}
 	}
 	return false
+}
+
+// Функция для добавления купленного предмета в инвентарь
+func addItemToInventory(username, itemName string, cost int) error {
+	log.Printf("addItemToInventory: Добавляем предмет %s игроку %s за %d фишек", itemName, username, cost)
+
+	if redisClient == nil {
+		return fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+
+	// Ищем существующий предмет такого типа у пользователя
+	inventory, err := getPlayerInventory(username)
+	if err != nil {
+		return fmt.Errorf("failed to get inventory: %v", err)
+	}
+
+	// Ищем предмет с таким же именем и ценой
+	var existingItem *InventoryItem
+	for i := range inventory {
+		if inventory[i].PrizeName == itemName && inventory[i].Cost == cost {
+			existingItem = &inventory[i]
+			break
+		}
+	}
+
+	if existingItem != nil {
+		// Увеличиваем счетчик существующего предмета
+		existingItem.Count++
+		key := fmt.Sprintf("inventory:%s:%s", username, existingItem.Hash)
+
+		// Сохраняем обновленный предмет
+		data, err := json.Marshal(existingItem)
+		if err != nil {
+			log.Printf("addItemToInventory: Ошибка маршалинга обновленного предмета: %v", err)
+			return fmt.Errorf("failed to marshal updated inventory item: %v", err)
+		}
+
+		err = redisClient.Set(ctx, key, data, 0).Err()
+		if err != nil {
+			log.Printf("addItemToInventory: Ошибка сохранения обновленного предмета в Redis: %v", err)
+			return fmt.Errorf("failed to save updated item to Redis: %v", err)
+		}
+
+		log.Printf("addItemToInventory: Счетчик предмета %s увеличен до %d для игрока %s", itemName, existingItem.Count, username)
+	} else {
+		// Создаем новый предмет
+		itemHash := generateItemHash(username, itemName)
+		key := fmt.Sprintf("inventory:%s:%s", username, itemHash)
+
+		item := InventoryItem{
+			PrizeName: itemName,
+			Rarity:    "shop",
+			Cost:      cost,
+			Count:     1,
+			Hash:      itemHash,
+		}
+
+		// Сохраняем в Redis
+		data, err := json.Marshal(item)
+		if err != nil {
+			log.Printf("addItemToInventory: Ошибка маршалинга нового предмета: %v", err)
+			return fmt.Errorf("failed to marshal new inventory item: %v", err)
+		}
+
+		err = redisClient.Set(ctx, key, data, 0).Err()
+		if err != nil {
+			log.Printf("addItemToInventory: Ошибка сохранения нового предмета в Redis: %v", err)
+			return fmt.Errorf("failed to save new item to Redis: %v", err)
+		}
+
+		log.Printf("addItemToInventory: Новый предмет %s добавлен в инвентарь игрока %s", itemName, username)
+	}
+
+	return nil
+}
+
+// Функция для использования (удаления) предмета из инвентаря
+func useItemFromInventory(username, itemName string) error {
+	log.Printf("useItemFromInventory: Используем предмет %s у игрока %s", itemName, username)
+
+	if redisClient == nil {
+		return fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+
+	// Ищем предмет в инвентаре
+	inventory, err := getPlayerInventory(username)
+	if err != nil {
+		return fmt.Errorf("failed to get inventory: %v", err)
+	}
+
+	// Ищем предмет "Оборудование для грабежа"
+	var foundItem *InventoryItem
+	for i := range inventory {
+		if inventory[i].PrizeName == itemName && inventory[i].Rarity == "shop" {
+			foundItem = &inventory[i]
+			break
+		}
+	}
+
+	if foundItem == nil {
+		return fmt.Errorf("item not found in inventory")
+	}
+
+	// Уменьшаем счетчик предмета
+	foundItem.Count--
+
+	key := fmt.Sprintf("inventory:%s:%s", username, foundItem.Hash)
+
+	if foundItem.Count <= 0 {
+		// Если предметов больше нет, удаляем запись полностью
+		err = redisClient.Del(ctx, key).Err()
+		if err != nil {
+			log.Printf("useItemFromInventory: Ошибка удаления предмета %s: %v", foundItem.Hash, err)
+			return fmt.Errorf("failed to remove item from Redis: %v", err)
+		}
+		log.Printf("useItemFromInventory: Последний предмет %s удален из инвентаря игрока %s", itemName, username)
+	} else {
+		// Сохраняем обновленный предмет с уменьшенным счетчиком
+		data, err := json.Marshal(foundItem)
+		if err != nil {
+			log.Printf("useItemFromInventory: Ошибка маршалинга обновленного предмета: %v", err)
+			return fmt.Errorf("failed to marshal updated inventory item: %v", err)
+		}
+
+		err = redisClient.Set(ctx, key, data, 0).Err()
+		if err != nil {
+			log.Printf("useItemFromInventory: Ошибка сохранения обновленного предмета в Redis: %v", err)
+			return fmt.Errorf("failed to save updated item to Redis: %v", err)
+		}
+		log.Printf("useItemFromInventory: Счетчик предмета %s уменьшен до %d для игрока %s", itemName, foundItem.Count, username)
+	}
+
+	log.Printf("useItemFromInventory: Предмет %s успешно использован игроком %s", itemName, username)
+	return nil
 }
 
 // Функция для инициализации балансов участников
@@ -1955,11 +2194,23 @@ func main() {
 
 				case "clearallinv":
 					log.Printf("Команда /clearallinv: Вызвана пользователем %s", userName)
+					args := update.Message.CommandArguments()
 
 					// Команда для очистки всех инвентарей (только для администраторов)
 					if userName != "hunnidstooblue" && userName != "iamnothiding" {
 						log.Printf("Команда /clearallinv: Отклонена - пользователь %s не администратор", userName)
 						msg.Text = "🚫 Только администраторы могут использовать эту команду!"
+						break
+					}
+
+					// Проверяем подтверждение
+					if args != "confirm" {
+						msg.Text = "⚠️ **ВНИМАНИЕ!**\n\n" +
+							"Эта команда очистит ИНВЕНТАРИ ВСЕХ ИГРОКОВ!\n" +
+							"Все предметы будут удалены без возможности восстановления!\n\n" +
+							"Для подтверждения введите:\n" +
+							"`/clearallinv confirm`"
+						msg.ReplyToMessageID = update.Message.MessageID
 						break
 					}
 
@@ -2003,11 +2254,23 @@ func main() {
 
 				case "setdefaultbalance":
 					log.Printf("Команда /setdefaultbalance: Вызвана пользователем %s", userName)
+					args := update.Message.CommandArguments()
 
 					// Команда для установки баланса 1000 фишек всем игрокам (только для администраторов)
 					if userName != "hunnidstooblue" && userName != "iamnothiding" {
 						log.Printf("Команда /setdefaultbalance: Отклонена - пользователь %s не администратор", userName)
 						msg.Text = "🚫 Только администраторы могут использовать эту команду!"
+						break
+					}
+
+					// Проверяем подтверждение
+					if args != "confirm" {
+						msg.Text = "⚠️ **ВНИМАНИЕ!**\n\n" +
+							"Эта команда установит БАЛАНС 1000 ФИШЕК ВСЕМ ИГРОКАМ!\n" +
+							"Текущие балансы будут заменены!\n\n" +
+							"Для подтверждения введите:\n" +
+							"`/setdefaultbalance confirm`"
+						msg.ReplyToMessageID = update.Message.MessageID
 						break
 					}
 
@@ -2256,10 +2519,22 @@ func main() {
 							playerBalances[userName] = 0 // Исправляем отрицательный баланс
 							balance = 0
 						}
+
+						// Обновляем штрафы перед показом
+						updateFinesDaily()
+
 						bankBalance := playerBanks[userName] // 0 если не существует
+						fineBalance := playerFines[userName] // 0 если не существует
 						totalBalance := balance + bankBalance
-						msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("💰 Ваш баланс: %d %s\n🏦 В банке: %d %s\n💵 Итого: %d %s",
-							balance, getChipsWord(balance), bankBalance, getChipsWord(bankBalance), totalBalance, getChipsWord(totalBalance)))
+
+						balanceText := fmt.Sprintf("💰 Ваш баланс: %d %s\n🏦 В банке: %d %s\n💵 Итого: %d %s",
+							balance, getChipsWord(balance), bankBalance, getChipsWord(bankBalance), totalBalance, getChipsWord(totalBalance))
+
+						if fineBalance > 0 {
+							balanceText += fmt.Sprintf("\n\n⚠️ **ДОЛГ ПО ШТРАФУ:** %d %s\n💸 Выплатить: /payfine", fineBalance, getChipsWord(fineBalance))
+						}
+
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, balanceText)
 						msg.ReplyToMessageID = update.Message.MessageID
 						if _, err := bot.Send(msg); err != nil {
 							log.Panic(err)
@@ -2280,7 +2555,7 @@ func main() {
 					if args == "" {
 						// Показать справку по банку
 						bankBalance := playerBanks[userName] // 0 если не существует
-						msg.Text = fmt.Sprintf("🏦 БАНК - безопасное хранение фишек!\n\n💰 На счету: %d %s\n💵 На руках: %d %s\n\n📋 Команды:\n• /bank add 1000 - положить 1000 фишек в банк\n• /bank get 500 - снять 500 фишек из банка\n\n⚠️ Фишки в банке нельзя тратить на ставки!",
+						msg.Text = fmt.Sprintf("🏦 БАНК - безопасное хранение фишек!\n\n💰 На счету: %d %s\n💵 На руках: %d %s\n\n📋 Команды:\n• /bank add 1000 - положить 1000 фишек в банк\n• /bank add all - положить все деньги в банк\n• /bank get 500 - снять 500 фишек из банка\n\n⚠️ Фишки в банке нельзя тратить на ставки!",
 							bankBalance, getChipsWord(bankBalance), playerBalances[userName], getChipsWord(playerBalances[userName]))
 						msg.ReplyToMessageID = update.Message.MessageID
 						break
@@ -2288,19 +2563,38 @@ func main() {
 
 					parts := strings.Split(args, " ")
 					if len(parts) < 2 {
-						msg.Text = "🏦 Укажите операцию и сумму!\nПримеры:\n• /bank add 1000\n• /bank get 500"
+						msg.Text = "🏦 Укажите операцию и сумму!\nПримеры:\n• /bank add 1000\n• /bank add all\n• /bank get 500"
 						msg.ReplyToMessageID = update.Message.MessageID
 						break
 					}
 
 					operation := strings.ToLower(strings.TrimSpace(parts[0]))
-					amountStr := strings.TrimSpace(parts[1])
+					amountStr := strings.ToLower(strings.TrimSpace(parts[1]))
 
-					amount, err := strconv.Atoi(amountStr)
-					if err != nil || amount <= 0 {
-						msg.Text = "🏦 Укажите корректную положительную сумму!"
-						msg.ReplyToMessageID = update.Message.MessageID
-						break
+					var amount int
+					var err error
+
+					// Проверяем, не "all" ли это
+					if amountStr == "all" {
+						if operation == "add" {
+							amount = playerBalances[userName]
+							if amount <= 0 {
+								msg.Text = "🏦 У вас нет денег на руках для перевода в банк!"
+								msg.ReplyToMessageID = update.Message.MessageID
+								break
+							}
+						} else {
+							msg.Text = "🏦 Команда 'all' доступна только для операции 'add'!"
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+					} else {
+						amount, err = strconv.Atoi(amountStr)
+						if err != nil || amount <= 0 {
+							msg.Text = "🏦 Укажите корректную положительную сумму или 'all'!"
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
 					}
 
 					if operation == "add" {
@@ -2728,7 +3022,7 @@ func main() {
 					log.Printf("Команда /leaderboard: сортировка завершена, топ игрок: %s с %d фишками", filteredPlayers[0].username, filteredPlayers[0].value)
 
 					// Формируем сообщение
-					msg.Text = "🏆 ДОСКA ЛИДЕРОВ ПО СТОИМОСТИ ИНВЕНТАРЯ 🏆\n\n"
+					msg.Text = "🏆 ТОП ИГРОКОВ ПО СТОИМОСТИ ИНВЕНТАРЯ 🏆\n\n"
 
 					for i, player := range filteredPlayers {
 						if i >= 10 { // Показываем только топ-10
@@ -2737,12 +3031,6 @@ func main() {
 
 						// Получаем имя участника по username
 						participantName := getParticipantNameByUsername(player.username)
-
-						// Получаем надетую плашку для отображения
-						wornItem := ""
-						if wornData, err := getWornItem(player.username); err == nil && wornData != nil {
-							wornItem = " " + wornData["name"]
-						}
 
 						emoji := ""
 						switch i {
@@ -2756,35 +3044,7 @@ func main() {
 							emoji = fmt.Sprintf("%d.", i+1)
 						}
 
-						msg.Text += fmt.Sprintf("%s %s%s\n", emoji, participantName, wornItem)
-
-						// Показываем список предметов
-						playerItems := inventoryItems[player.username]
-						if len(playerItems) > 0 {
-							// Группируем предметы по имени для краткости
-							itemCounts := make(map[string]int)
-							for _, item := range playerItems {
-								itemCounts[item.PrizeName]++
-							}
-
-							itemList := ""
-							for itemName, count := range itemCounts {
-								if itemList != "" {
-									itemList += ", "
-								}
-								if count > 1 {
-									itemList += fmt.Sprintf("%s x%d", itemName, count)
-								} else {
-									itemList += itemName
-								}
-							}
-
-							msg.Text += fmt.Sprintf("   📦 %s\n", itemList)
-						} else {
-							msg.Text += "   📦 Пусто\n"
-						}
-
-						msg.Text += fmt.Sprintf("   💰 Стоимость: %d фишек\n\n", player.value)
+						msg.Text += fmt.Sprintf("%s %s\n", emoji, participantName)
 					}
 
 					// Добавляем информацию о текущем игроке, если он не в топ-10
@@ -2883,24 +3143,28 @@ func main() {
 						"💰 ЭКОНОМИКА:\n" +
 						"/balance - посмотреть свой баланс\n" +
 						"/bank - управление банковским счетом\n" +
-						"/bank add (сумма) - положить фишки в банк\n" +
+						"/bank add (сумма/all) - положить фишки в банк\n" +
 						"/bank get (сумма) - снять фишки из банка\n" +
+						"/shop - магазин \n" +
+						"/shop buy 1/2 [кол-во] - купить оборудование (1=грабеж, 2=разведка)\n" +
+						"/sell (хэш) - продать предмет (оборудование: 500)\n" +
 						"/inv - посмотреть свой инвентарь плашек\n" +
 						"/sell (хэш) - продать плашку\n" +
 						"/wear (хэш) - надеть плашку\n" +
 						"/unwear - снять плашку\n" +
 						"/pay (@username сумма) - перевести фишки другому игроку\n" +
+						"/payfine - оплатить штраф (если есть долг)\n" +
 						"/bet (номер сумма) - сделать ставку на участника\n" +
 						"/bet (номер all) - поставить все деньги\n" +
-						"/coin (1/2/3 сумма/all) - бросок монеты (1=орел, 2=решка, 3=ребро, all=весь баланс)\n\n" +
+						"/coin (1/2/3 сумма/all) - бросок монеты (1=орел, 2=решка, 3=ребро, all=весь баланс)\n" +
+						"/rob (@username) - ограбить игрока (30% успех, 30% штраф, 40% бегство)\n" +
+						"/platerob (@username) - ограбить плашку игрока (с надетой или из инвентаря)\n" +
+						"/scout (@username) - разведка игрока (70% успех)\n\n" +
 						"👑 АДМИНИСТРАТОРСКИЕ КОМАНДЫ:\n" +
 						"/add (Имя Фамилия username) - добавить участника\n" +
 						"/remove (Имя Фамилия) - удалить участника\n" +
 						"/setprize (ID плашки) - установить плашку для игры\n" +
 						"/loadfromfile - загрузить призы из prizes.json в Redis\n" +
-						"/removefromredis - удалить все призы из Redis\n" +
-						"/clearallinv - очистить инвентари всех игроков\n" +
-						"/setdefaultbalance - установить всем игрокам баланс 1000 фишек\n" +
 						"/poll - голосование\n" +
 						"/givefunds (@username сумма) - дать деньги игроку\n" +
 						"/withdrawfunds (@username сумма) - снять деньги у игрока\n" +
@@ -2927,9 +3191,18 @@ func main() {
 						commonItems := []InventoryItem{}
 						rareItems := []InventoryItem{}
 						legendaryItems := []InventoryItem{}
+						shopItems := []InventoryItem{}
 
 						for _, item := range inventory {
-							totalValue += item.Cost * item.Count
+							itemValue := item.Cost * item.Count
+							if item.Rarity == "shop" {
+								if item.PrizeName == "Оборудование для разведки" {
+									itemValue = 50 * item.Count // Оборудование для разведки оценивается в 50
+								} else {
+									itemValue = 500 * item.Count // Оборудование для грабежа оценивается в 500
+								}
+							}
+							totalValue += itemValue
 							switch item.Rarity {
 							case "common":
 								commonItems = append(commonItems, item)
@@ -2937,31 +3210,65 @@ func main() {
 								rareItems = append(rareItems, item)
 							case "legendary":
 								legendaryItems = append(legendaryItems, item)
+							case "shop":
+								shopItems = append(shopItems, item)
 							}
 						}
 
 						// Показываем по редкостям
+						if len(shopItems) > 0 {
+							msg.Text += "\n🛒 **МАГАЗИННЫЕ ПРЕДМЕТЫ:**\n"
+							for _, item := range shopItems {
+								var sellPrice int
+								if item.PrizeName == "Оборудование для разведки" {
+									sellPrice = 50 // Оборудование для разведки продается за 50
+								} else {
+									sellPrice = 500 // Оборудование для грабежа продается за 500
+								}
+
+								countText := ""
+								if item.Count > 1 {
+									countText = fmt.Sprintf(" x%d", item.Count)
+								}
+
+								msg.Text += fmt.Sprintf("  %s%s [хэш: %s] (%d фишек) - /sell %s\n",
+									item.PrizeName, countText, item.Hash, sellPrice, item.Hash)
+							}
+						}
+
 						if len(legendaryItems) > 0 {
 							msg.Text += "\n🔥 **ЛЕГЕНДАРНЫЕ:**\n"
 							for _, item := range legendaryItems {
-								msg.Text += fmt.Sprintf("  %s [хэш: %s] (%d фишек) - /sell %s\n",
-									item.PrizeName, item.Hash, item.Cost, item.Hash)
+								countText := ""
+								if item.Count > 1 {
+									countText = fmt.Sprintf(" x%d", item.Count)
+								}
+								msg.Text += fmt.Sprintf("  %s%s [хэш: %s] (%d фишек) - /sell %s\n",
+									item.PrizeName, countText, item.Hash, item.Cost, item.Hash)
 							}
 						}
 
 						if len(rareItems) > 0 {
 							msg.Text += "\n💎 **РЕДКИЕ:**\n"
 							for _, item := range rareItems {
-								msg.Text += fmt.Sprintf("  %s [хэш: %s] (%d фишек) - /sell %s\n",
-									item.PrizeName, item.Hash, item.Cost, item.Hash)
+								countText := ""
+								if item.Count > 1 {
+									countText = fmt.Sprintf(" x%d", item.Count)
+								}
+								msg.Text += fmt.Sprintf("  %s%s [хэш: %s] (%d фишек) - /sell %s\n",
+									item.PrizeName, countText, item.Hash, item.Cost, item.Hash)
 							}
 						}
 
 						if len(commonItems) > 0 {
 							msg.Text += "\n⚪ **ОБЫЧНЫЕ:**\n"
 							for _, item := range commonItems {
-								msg.Text += fmt.Sprintf("  %s [хэш: %s] (%d фишек) - /sell %s\n",
-									item.PrizeName, item.Hash, item.Cost, item.Hash)
+								countText := ""
+								if item.Count > 1 {
+									countText = fmt.Sprintf(" x%d", item.Count)
+								}
+								msg.Text += fmt.Sprintf("  %s%s [хэш: %s] (%d фишек) - /sell %s\n",
+									item.PrizeName, countText, item.Hash, item.Cost, item.Hash)
 							}
 						}
 
@@ -2973,6 +3280,650 @@ func main() {
 					}
 
 					// Отвечаем на сообщение пользователя
+					msg.ReplyToMessageID = update.Message.MessageID
+
+				case "shop":
+					log.Printf("Команда /shop: Вызвана пользователем %s", userName)
+					args := update.Message.CommandArguments()
+
+					if args == "" {
+						// Показать доступные товары
+						msg.Text = "🛒 МАГАЗИН\n\n" +
+							"💰 Доступные товары:\n\n" +
+							"1️⃣ **Оборудование для грабежа** - 1,000 фишек\n" +
+							"   Специальное оборудование для проведения грабежей\n" +
+							"   📦 Хранится в инвентаре\n" +
+							"   🎯 Шанс успеха: 30% (украсть до 50% баланса)\n" +
+							"   💸 Штраф: 30% (потерять 10% баланса)\n" +
+							"   🏃‍♂️ Бегство: 40% (ничего не происходит)\n\n" +
+							"2️⃣ **Оборудование для разведки** - 100 фишек\n" +
+							"   Позволяет шпионить за балансами и инвентарем других игроков\n" +
+							"   📦 Хранится в инвентаре\n" +
+							"   👁️ Шанс успеха: 70%\n" +
+							"💡 Для покупки используйте:\n• /shop buy 1 [кол-во] (грабеж)\n• /shop buy 2 [кол-во] (разведка)\n\n" +
+							"⚠️ Оборудование можно использовать только один раз!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Обработка покупки
+					parts := strings.Split(args, " ")
+					if len(parts) < 2 || parts[0] != "buy" {
+						msg.Text = "🚫 Неверный формат команды!\n\n💡 Примеры:\n• /shop buy 1 (купить 1 шт)\n• /shop buy 1 5 (купить 5 шт)"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					itemID := parts[1]
+
+					// Парсим количество (по умолчанию 1)
+					quantity := 1
+					if len(parts) >= 3 {
+						var err error
+						quantity, err = strconv.Atoi(parts[2])
+						if err != nil || quantity <= 0 {
+							msg.Text = "🚫 Неверное количество!\n\n💡 Пример: /shop buy 1 5"
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+						if quantity > 10 {
+							msg.Text = "🚫 Максимум можно купить 10 штук за раз!"
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+					}
+
+					var itemName string
+					var itemCost int
+					var itemDescription string
+
+					switch itemID {
+					case "1", "robbery_gear":
+						itemName = "Оборудование для грабежа"
+						itemCost = 1000
+						itemDescription = "🔫 **Оборудование для грабежа**"
+					case "2", "scout_gear":
+						itemName = "Оборудование для разведки"
+						itemCost = 100
+						itemDescription = "🕵️ **Оборудование для разведки**"
+					default:
+						msg.Text = "🚫 Неизвестный товар!\n\n💡 Доступные товары:\n• 1 или robbery_gear - Оборудование для грабежа\n• 2 или scout_gear - Оборудование для разведки"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Считаем общую стоимость
+					totalCost := itemCost * quantity
+
+					// Проверяем баланс
+					userBalance, exists := playerBalances[userName]
+					if !exists || userBalance < totalCost {
+						msg.Text = fmt.Sprintf("🚫 Недостаточно средств!\n💰 Ваш баланс: %d фишек\n💸 Стоимость %d шт: %d фишек", userBalance, quantity, totalCost)
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Списываем деньги
+					if !changeBalance(userName, -totalCost) {
+						msg.Text = "🚫 Ошибка при списании средств!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Добавляем предметы в инвентарь
+					var successCount int
+					for i := 0; i < quantity; i++ {
+						err := addItemToInventory(userName, itemName, itemCost)
+						if err != nil {
+							log.Printf("Ошибка добавления предмета %d в инвентарь: %v", i+1, err)
+							break
+						}
+						successCount++
+					}
+
+					if successCount < quantity {
+						// Возвращаем деньги за неудачные покупки
+						refund := (quantity - successCount) * itemCost
+						changeBalance(userName, refund)
+						msg.Text = fmt.Sprintf("🚫 Добавлено только %d из %d товаров!\n💰 Возвращено: %d фишек\n\n📦 Проверьте инвентарь: /inv", successCount, quantity, refund)
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					msg.Text = fmt.Sprintf("✅ **ПОКУПКА УСПЕШНО ЗАВЕРШЕНА!**\n\n"+
+						"%s x%d добавлено в ваш инвентарь!\n\n"+
+						"💰 Списано: %d фишек\n", itemDescription, quantity, totalCost) +
+						"💵 Остаток: " + fmt.Sprintf("%d фишек", playerBalances[userName]) + "\n\n" +
+						"📦 Проверить инвентарь: /inv\n" +
+						"⚠️ Оборудование можно использовать только один раз!"
+
+					msg.ReplyToMessageID = update.Message.MessageID
+
+				case "payfine":
+					log.Printf("Команда /payfine от %s", userName)
+
+					// Проверяем, есть ли штраф у игрока
+					fineAmount := playerFines[userName]
+					if fineAmount <= 0 {
+						msg.Text = "✅ У вас нет долгов по штрафам!\n\n💸 Ваша душа чиста."
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем баланс игрока
+					userBalance := playerBalances[userName]
+					if userBalance < fineAmount {
+						msg.Text = fmt.Sprintf("🚫 Недостаточно средств для оплаты штрафа!\n\n"+
+							"💸 Штраф: %d %s\n"+
+							"💰 Ваш баланс: %d %s\n"+
+							"💸 Не хватает: %d %s",
+							fineAmount, getChipsWord(fineAmount),
+							userBalance, getChipsWord(userBalance),
+							fineAmount-userBalance, getChipsWord(fineAmount-userBalance))
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Списываем штраф
+					if !changeBalance(userName, -fineAmount) {
+						msg.Text = "🚫 Ошибка при оплате штрафа!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Удаляем штраф
+					delete(playerFines, userName)
+					delete(playerFineDates, userName)
+
+					// Сохраняем изменения в Redis
+					err := saveFinesToRedis()
+					if err != nil {
+						log.Printf("Ошибка сохранения штрафов после оплаты: %v", err)
+					}
+
+					msg.Text = fmt.Sprintf("✅ **ШТРАФ ОПЛАЧЕН!**\n\n"+
+						"💸 Оплачено: %d %s\n"+
+						"💵 Остаток баланса: %d %s\n\n"+
+						"🎉 Теперь вы свободны от долгов!",
+						fineAmount, getChipsWord(fineAmount),
+						playerBalances[userName], getChipsWord(playerBalances[userName]))
+
+					msg.ReplyToMessageID = update.Message.MessageID
+
+				case "rob":
+					log.Printf("Команда /rob от %s", userName)
+					args := update.Message.CommandArguments()
+
+					if args == "" {
+						msg.Text = "🚫 Укажите цель ограбления! Пример: /rob @username\n\n" +
+							"🎯 Шанс успеха: 30% (украсть до 50% баланса жертвы)\n" +
+							"💸 Штраф: 30% (10% от вашего баланса)\n" +
+							"🏃‍♂️ Бегство: 40% (ничего не происходит)\n" +
+							"⚠️ Требуется оборудование для грабежа (купить: /shop buy 1)"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Парсим цель
+					targetUsername := strings.TrimPrefix(strings.TrimSpace(args), "@")
+					if targetUsername == "" {
+						msg.Text = "🚫 Укажите корректное имя пользователя! Пример: /rob @username"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем, что не грабим себя
+					if targetUsername == userName {
+						msg.Text = "🚫 Нельзя грабить самого себя, идиот!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем, что цель существует
+					targetBalance, targetExists := playerBalances[targetUsername]
+					if !targetExists {
+						msg.Text = fmt.Sprintf("🚫 Жертва @%s не найдена в списке участников!", targetUsername)
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем, что у жертвы есть деньги
+					if targetBalance <= 0 {
+						msg.Text = fmt.Sprintf("🚫 У жертвы @%s нет денег для грабежа!", targetUsername)
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем наличие оборудования
+					err := useItemFromInventory(userName, "Оборудование для грабежа")
+					if err != nil {
+						msg.Text = "🚫 У вас нет оборудования для грабежа!\n\n🛒 Купить: /shop buy robbery_gear"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Генерируем результат ограбления (30% успех, 30% штраф, 40% бегство)
+					r := crand.New(crand.NewSource(time.Now().UnixNano()))
+					result := r.Intn(100) // 0-99
+
+					if result < 30 { // 30% шанс успеха
+						// Успешное ограбление - крадем до 50% от баланса жертвы
+						maxSteal := targetBalance / 2
+						if maxSteal < 1 {
+							maxSteal = 1
+						}
+						stolenAmount := r.Intn(maxSteal) + 1
+
+						// Выполняем ограбление
+						if !changeBalance(targetUsername, -stolenAmount) {
+							msg.Text = "🚫 Ошибка при ограблении!"
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+
+						changeBalance(userName, stolenAmount)
+
+						msg.Text = fmt.Sprintf("✅ **УСПЕШНОЕ ОГРАБЛЕНИЕ!**\n\n"+
+							"🔫 Вы ограбили @%s!\n"+
+							"💰 Украдено: %d %s\n"+
+							"💵 Ваш баланс: %d %s\n\n"+
+							"🏃‍♂️ Удачно смылись!",
+							targetUsername, stolenAmount, getChipsWord(stolenAmount),
+							playerBalances[userName], getChipsWord(playerBalances[userName]))
+					} else if result < 60 { // 30% шанс штрафа (30-59)
+						// Неудачное ограбление - штраф 10% от баланса грабителя (минимум 1000)
+						penalty := playerBalances[userName] / 10
+						if penalty < 1000 {
+							penalty = 1000
+						}
+
+						// Обновляем штрафы перед проверкой
+						updateFinesDaily()
+
+						if playerBalances[userName] >= penalty {
+							// Списываем штраф с баланса
+							changeBalance(userName, -penalty)
+							msg.Text = fmt.Sprintf("❌ **ОГРАБЛЕНИЕ ПРОВАЛИЛОСЬ!**\n\n"+
+								"🚔 Вас поймали при попытке ограбить @%s!\n"+
+								"💸 Штраф: %d %s\n"+
+								"💵 Ваш баланс: %d %s\n\n"+
+								"🏃‍♂️ Пришлось бежать!",
+								targetUsername, penalty, getChipsWord(penalty),
+								playerBalances[userName], getChipsWord(playerBalances[userName]))
+						} else {
+							// Недостаточно денег - добавляем в долг
+							remainingPenalty := penalty - playerBalances[userName]
+							// Списываем все что есть
+							if playerBalances[userName] > 0 {
+								changeBalance(userName, -playerBalances[userName])
+							}
+							// Добавляем остаток в штрафы
+							playerFines[userName] += remainingPenalty
+							playerFineDates[userName] = time.Now()
+							saveFinesToRedis()
+
+							msg.Text = fmt.Sprintf("❌ **ОГРАБЛЕНИЕ ПРОВАЛИЛОСЬ!**\n\n"+
+								"🚔 Вас поймали при попытке ограбить @%s!\n"+
+								"💸 Штраф: %d %s\n"+
+								"💰 С вашего баланса списано: %d %s\n"+
+								"💸 Долг по штрафу: %d %s\n"+
+								"⚠️ Штраф увеличивается на 10%% каждый день!\n\n"+
+								"💵 Ваш баланс: %d %s\n\n"+
+								"🏃‍♂️ Пришлось бежать!",
+								targetUsername, penalty, getChipsWord(penalty),
+								playerBalances[userName]+remainingPenalty, getChipsWord(playerBalances[userName]+remainingPenalty),
+								playerFines[userName], getChipsWord(playerFines[userName]),
+								playerBalances[userName], getChipsWord(playerBalances[userName]))
+						}
+					} else { // 40% шанс бегства (60-99)
+						// Ничего не происходит - просто бегство
+						msg.Text = fmt.Sprintf("😅 **НИХУЯ НЕ ВЫШЛО!**\n\n"+
+							"🏃‍♂️ Вы попытались ограбить @%s, но ничего не получилось!\n"+
+							"🚶‍♂️ Просто зассали и ушли...\n\n"+
+							"💵 Ваш баланс: %d %s\n\n"+
+							"😏 Может повезет в следующий раз?",
+							targetUsername, playerBalances[userName], getChipsWord(playerBalances[userName]))
+					}
+
+					msg.ReplyToMessageID = update.Message.MessageID
+
+				case "platerob":
+					log.Printf("Команда /platerob от %s", userName)
+					args := update.Message.CommandArguments()
+
+					if args == "" {
+						msg.Text = "🚫 Укажите цель ограбления плашки! Пример: /platerob @username\n\n" +
+							"🎯 Шанс успеха зависит от редкости плашки цели:\n" +
+							"⭐ Обычная плашка: 50% успеха\n" +
+							"💎 Редкая плашка: 25% успеха\n" +
+							"👑 Легендарная плашка: 10% успеха\n" +
+							"🎒 Если нет надетой плашки - крадет из инвентаря\n" +
+							"💸 При провале: штраф 1000 фишек\n" +
+							"⚠️ Требуется оборудование для грабежа (купить: /shop buy robbery_gear)"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Парсим цель
+					targetUsername := strings.TrimPrefix(strings.TrimSpace(args), "@")
+					if targetUsername == "" {
+						msg.Text = "🚫 Укажите корректное имя пользователя! Пример: /platerob @username"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем, что не грабим себя
+					if targetUsername == userName {
+						msg.Text = "🚫 Нельзя грабить плашку у самого себя, идиот!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем, что цель существует
+					_, targetExists := playerBalances[targetUsername]
+					if !targetExists {
+						msg.Text = fmt.Sprintf("🚫 Жертва @%s не найдена в списке участников!", targetUsername)
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем, что у цели есть надетая плашка или плашки в инвентаре
+					targetWornData, targetWornErr := getWornItem(targetUsername)
+					var targetItem InventoryItem
+					var stealingFromWorn bool = true
+
+					if targetWornErr != nil || targetWornData == nil {
+						// Нет надетой плашки, проверяем инвентарь на наличие плашек
+						targetInventory, invErr := getPlayerInventory(targetUsername)
+						if invErr != nil {
+							log.Printf("platerob: Ошибка получения инвентаря цели %s: %v", targetUsername, invErr)
+							msg.Text = "🚫 Ошибка при проверке цели!"
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+
+						// Ищем плашки в инвентаре (предметы с rarity common/rare/legendary, но не shop)
+						var availablePlates []InventoryItem
+						for _, item := range targetInventory {
+							if item.Rarity != "shop" && item.Count > 0 {
+								availablePlates = append(availablePlates, item)
+							}
+						}
+
+						if len(availablePlates) == 0 {
+							msg.Text = fmt.Sprintf("🚫 У жертвы @%s нет плашек для кражи!", targetUsername)
+							msg.ReplyToMessageID = update.Message.MessageID
+							break
+						}
+
+						// Выбираем случайную плашку
+						r := crand.New(crand.NewSource(time.Now().UnixNano()))
+						randomIndex := r.Intn(len(availablePlates))
+						targetItem = availablePlates[randomIndex]
+						stealingFromWorn = false
+
+						log.Printf("platerob: Выбрана плашка из инвентаря: %s (хэш: %s) у цели %s", targetItem.PrizeName, targetItem.Hash, targetUsername)
+					} else {
+						// Есть надетая плашка, создаем InventoryItem из wornData
+						targetItem = InventoryItem{
+							PrizeName: targetWornData["name"],
+							Rarity:    targetWornData["rarity"],
+							Hash:      targetWornData["hash"],
+							Cost:      0, // не важно для кражи
+							Count:     1, // всегда 1 для надетых
+						}
+					}
+
+					// Проверяем наличие оборудования для грабежа
+					err := useItemFromInventory(userName, "Оборудование для грабежа")
+					if err != nil {
+						msg.Text = "🚫 У вас нет оборудования для грабежа!\n\n🛒 Купить: /shop buy robbery_gear"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Определяем шанс успеха в зависимости от редкости плашки
+					targetRarity := targetItem.Rarity
+					successChance := 0
+
+					switch targetRarity {
+					case "common":
+						successChance = 50
+					case "rare":
+						successChance = 25
+					case "legendary":
+						successChance = 10
+					default:
+						successChance = 50 // fallback
+					}
+
+					// Генерируем результат ограбления плашки
+					r := crand.New(crand.NewSource(time.Now().UnixNano()))
+					result := r.Intn(100) // 0-99
+
+					if result < successChance {
+						// Успешное ограбление плашки
+						if stealingFromWorn {
+							// Кража надетой плашки
+							// Проверяем еще раз, что плашка все еще на цели (на случай если она была снята)
+							currentTargetWornData, currentTargetWornErr := getWornItem(targetUsername)
+							if currentTargetWornErr != nil || currentTargetWornData == nil || currentTargetWornData["hash"] != targetItem.Hash {
+								log.Printf("platerob: Плашка была изменена или снята у цели %s до завершения ограбления", targetUsername)
+								msg.Text = "🚫 Цель уже сняла или изменила плашку!"
+								msg.ReplyToMessageID = update.Message.MessageID
+								break
+							}
+
+							// Снимаем плашку с жертвы
+							unwearErr := unwearItem(targetUsername)
+							if unwearErr != nil {
+								log.Printf("platerob: Ошибка снятия плашки с жертвы %s: %v", targetUsername, unwearErr)
+								msg.Text = "🚫 Ошибка при ограблении плашки!"
+								msg.ReplyToMessageID = update.Message.MessageID
+								break
+							}
+
+							// Надеваем плашку на грабителя
+							wearErr := wearItem(userName, targetItem.Hash)
+							if wearErr != nil {
+								log.Printf("platerob: Ошибка надевания плашки на грабителя %s: %v", userName, wearErr)
+								// Возвращаем плашку жертве в случае ошибки
+								returnErr := wearItem(targetUsername, targetItem.Hash)
+								if returnErr != nil {
+									log.Printf("platerob: КРИТИЧЕСКАЯ ОШИБКА: Не удалось вернуть плашку %s жертве %s после ошибки надевания на грабителя %s", targetItem.Hash, targetUsername, userName)
+								}
+								msg.Text = "🚫 Ошибка при ограблении плашки!"
+								msg.ReplyToMessageID = update.Message.MessageID
+								break
+							}
+						} else {
+							// Кража плашки из инвентаря
+							// Проверяем, что предмет все еще есть у цели
+							targetInventory, checkErr := getPlayerInventory(targetUsername)
+							if checkErr != nil {
+								log.Printf("platerob: Ошибка проверки инвентаря цели %s: %v", targetUsername, checkErr)
+								msg.Text = "🚫 Ошибка при ограблении плашки!"
+								msg.ReplyToMessageID = update.Message.MessageID
+								break
+							}
+
+							// Ищем предмет в инвентаре цели
+							itemFound := false
+							for _, item := range targetInventory {
+								if item.Hash == targetItem.Hash && item.Count > 0 {
+									itemFound = true
+									break
+								}
+							}
+
+							if !itemFound {
+								log.Printf("platerob: Предмет %s больше не найден в инвентаре цели %s", targetItem.Hash, targetUsername)
+								msg.Text = "🚫 Плашка уже была использована или передана!"
+								msg.ReplyToMessageID = update.Message.MessageID
+								break
+							}
+
+							// Уменьшаем количество предмета у цели
+							removeErr := useItemFromInventory(targetUsername, targetItem.PrizeName)
+							if removeErr != nil {
+								log.Printf("platerob: Ошибка удаления предмета из инвентаря цели %s: %v", targetUsername, removeErr)
+								msg.Text = "🚫 Ошибка при ограблении плашки!"
+								msg.ReplyToMessageID = update.Message.MessageID
+								break
+							}
+
+							// Добавляем предмет в инвентарь грабителя
+							addErr := addItemToInventory(userName, targetItem.PrizeName, targetItem.Cost)
+							if addErr != nil {
+								log.Printf("platerob: Ошибка добавления предмета в инвентарь грабителя %s: %v", userName, addErr)
+								// Пытаемся вернуть предмет цели
+								returnErr := addItemToInventory(targetUsername, targetItem.PrizeName, targetItem.Cost)
+								if returnErr != nil {
+									log.Printf("platerob: КРИТИЧЕСКАЯ ОШИБКА: Не удалось вернуть плашку %s цели %s после ошибки добавления грабителю %s", targetItem.PrizeName, targetUsername, userName)
+								}
+								msg.Text = "🚫 Ошибка при ограблении плашки!"
+								msg.ReplyToMessageID = update.Message.MessageID
+								break
+							}
+						}
+
+						sourceText := "с надетой плашки"
+						if !stealingFromWorn {
+							sourceText = "из инвентаря"
+						}
+
+						msg.Text = fmt.Sprintf("✅ **ПЛАШКА УКРАДЕНА!**\n\n"+
+							"🔫 Вы успешно украли плашку у @%s (%s)!\n"+
+							"🏷️ Плашка: %s\n"+
+							"⭐ Редкость: %s\n\n"+
+							"🏃‍♂️ Удачно смылись!",
+							targetUsername, sourceText, targetItem.PrizeName, targetRarity)
+					} else {
+						// Неудачное ограбление плашки - фиксированный штраф 1000
+						penalty := 1000
+
+						// Обновляем штрафы перед проверкой
+						updateFinesDaily()
+
+						if playerBalances[userName] >= penalty {
+							// Списываем штраф с баланса
+							changeBalance(userName, -penalty)
+							msg.Text = fmt.Sprintf("❌ **ОГРАБЛЕНИЕ ПЛАШКИ ПРОВАЛИЛОСЬ!**\n\n"+
+								"🚔 Вас поймали при попытке украсть плашку у @%s!\n"+
+								"💸 Штраф: %d %s\n"+
+								"💵 Ваш баланс: %d %s\n\n"+
+								"🏃‍♂️ Пришлось бежать!",
+								targetUsername, penalty, getChipsWord(penalty),
+								playerBalances[userName], getChipsWord(playerBalances[userName]))
+						} else {
+							// Недостаточно денег - добавляем в долг
+							remainingPenalty := penalty - playerBalances[userName]
+							// Списываем все что есть
+							if playerBalances[userName] > 0 {
+								changeBalance(userName, -playerBalances[userName])
+							}
+							// Добавляем остаток в штрафы
+							playerFines[userName] += remainingPenalty
+							playerFineDates[userName] = time.Now()
+							saveFinesToRedis()
+
+							msg.Text = fmt.Sprintf("❌ **ОГРАБЛЕНИЕ ПЛАШКИ ПРОВАЛИЛОСЬ!**\n\n"+
+								"🚔 Вас поймали при попытке украсть плашку у @%s!\n"+
+								"💸 Штраф: %d %s\n"+
+								"💰 С вашего баланса списано: %d %s\n"+
+								"💸 Долг по штрафу: %d %s\n"+
+								"⚠️ Штраф увеличивается на 10%% каждый день!\n\n"+
+								"💵 Ваш баланс: %d %s\n\n"+
+								"🏃‍♂️ Пришлось бежать!",
+								targetUsername, penalty, getChipsWord(penalty),
+								playerBalances[userName]+remainingPenalty, getChipsWord(playerBalances[userName]+remainingPenalty),
+								playerFines[userName], getChipsWord(playerFines[userName]),
+								playerBalances[userName], getChipsWord(playerBalances[userName]))
+						}
+					}
+
+					msg.ReplyToMessageID = update.Message.MessageID
+
+				case "scout":
+					log.Printf("Команда /scout от %s", userName)
+					args := update.Message.CommandArguments()
+
+					if args == "" {
+						msg.Text = "🚫 Укажите цель разведки! Пример: /scout @username\n\n" +
+							"🕵️ Шанс успешной разведки: 70%\n" +
+							"👁️ При успехе: баланс, банк и количество предметов цели\n" +
+							"❌ При провале: ничего не покажет\n\n" +
+							"⚠️ Требуется оборудование для разведки (купить: /shop buy 2)"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Парсим цель
+					targetUsername := strings.TrimPrefix(strings.TrimSpace(args), "@")
+					if targetUsername == "" {
+						msg.Text = "🚫 Укажите корректное имя пользователя! Пример: /scout @username"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем, что не шпионим за собой
+					if targetUsername == userName {
+						msg.Text = "🚫 Нельзя шпионить за самим собой, идиот!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем, что цель существует
+					targetBalance, targetExists := playerBalances[targetUsername]
+					if !targetExists {
+						msg.Text = fmt.Sprintf("🚫 Цель @%s не найдена в списке участников!", targetUsername)
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем наличие оборудования
+					err := useItemFromInventory(userName, "Оборудование для разведки")
+					if err != nil {
+						msg.Text = "🚫 У вас нет оборудования для разведки!\n\n🛒 Купить: /shop buy scout_gear"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Генерируем результат разведки (70% успех, 30% неудача)
+					r := crand.New(crand.NewSource(time.Now().UnixNano()))
+					success := r.Intn(100) < 70 // 70% шанс успеха
+
+					if success {
+						// Успешная разведка - показываем информацию о цели
+						targetBank := playerBanks[targetUsername] // 0 если не существует
+
+						// Получаем инвентарь цели
+						targetInventory, err := getPlayerInventory(targetUsername)
+						inventoryInfo := "📦 Инвентарь пуст"
+						if err == nil && len(targetInventory) > 0 {
+							totalItems := 0
+							for _, item := range targetInventory {
+								totalItems += item.Count
+							}
+							inventoryInfo = fmt.Sprintf("📦 %d предметов в инвентаре", totalItems)
+						}
+
+						msg.Text = fmt.Sprintf("✅ **РАЗВЕДКА УСПЕШНА!**\n\n"+
+							"🕵️ Информация о цели @%s:\n\n"+
+							"💰 Баланс на руках: %d %s\n"+
+							"🏦 В банке: %d %s\n"+
+							"%s\n\n"+
+							"🔍 Разведка завершена!",
+							targetUsername, targetBalance, getChipsWord(targetBalance),
+							targetBank, getChipsWord(targetBank), inventoryInfo)
+					} else {
+						// Неудачная разведка
+						msg.Text = fmt.Sprintf("❌ **РАЗВЕДКА ПРОВАЛИЛАСЬ!**\n\n"+
+							"🕵️ Не удалось получить информацию о @%s!\n"+
+							"🚨 Возможно, цель заметила слежку!\n\n"+
+							"😅 Попробуйте позже!", targetUsername)
+					}
+
 					msg.ReplyToMessageID = update.Message.MessageID
 
 				case "sell":
@@ -3021,21 +3972,47 @@ func main() {
 						}
 					}
 
-					// Удаляем предмет из инвентаря
-					err = redisClient.Del(ctx, key).Err()
-					if err != nil {
-						log.Printf("Команда /sell: Ошибка удаления предмета %s: %v", itemHash, err)
-						msg.Text = "❌ Ошибка удаления предмета!"
-						break
+					// Уменьшаем счетчик предмета или удаляем если остался последний
+					item.Count--
+					if item.Count > 0 {
+						// Сохраняем обновленный предмет с уменьшенным счетчиком
+						data, err := json.Marshal(item)
+						if err != nil {
+							log.Printf("Команда /sell: Ошибка маршалинга обновленного предмета: %v", err)
+							msg.Text = "❌ Ошибка обновления предмета!"
+							break
+						}
+						err = redisClient.Set(ctx, key, data, 0).Err()
+						if err != nil {
+							log.Printf("Команда /sell: Ошибка сохранения обновленного предмета: %v", err)
+							msg.Text = "❌ Ошибка сохранения предмета!"
+							break
+						}
+					} else {
+						// Удаляем предмет если счетчик стал 0
+						err = redisClient.Del(ctx, key).Err()
+						if err != nil {
+							log.Printf("Команда /sell: Ошибка удаления предмета %s: %v", itemHash, err)
+							msg.Text = "❌ Ошибка удаления предмета!"
+							break
+						}
 					}
 
-					// Начисляем деньги игроку
-					changeBalance(userName, item.Cost)
+					// Начисляем деньги игроку (специальная цена для магазинных предметов)
+					sellPrice := item.Cost
+					if item.Rarity == "shop" {
+						if item.PrizeName == "Оборудование для разведки" {
+							sellPrice = 50 // Оборудование для разведки продается за 50
+						} else {
+							sellPrice = 500 // Оборудование для грабежа продается за 500
+						}
+					}
+					changeBalance(userName, sellPrice)
 
-					log.Printf("Команда /sell: Предмет %s продан за %d фишек пользователем %s", item.PrizeName, item.Cost, userName)
+					log.Printf("Команда /sell: Предмет %s продан за %d фишек пользователем %s", item.PrizeName, sellPrice, userName)
 
 					// Формируем сообщение
-					msg.Text = fmt.Sprintf("✅ Предмет \"%s\" продан за %d фишек!", item.PrizeName, item.Cost)
+					msg.Text = fmt.Sprintf("✅ Предмет \"%s\" продан за %d фишек!", item.PrizeName, sellPrice)
 					if itemWasWorn {
 						msg.Text += "\n👕 Плашка автоматически снята с вашего имени!"
 					}
@@ -3111,9 +4088,22 @@ func main() {
 					}
 
 				case "removefromredis":
+					args := update.Message.CommandArguments()
+
 					// Проверяем, является ли пользователь администратором
 					if userName != "hunnidstooblue" && userName != "iamnothiding" {
 						msg.Text = "🚫 Только администраторы могут удалять призы!"
+						break
+					}
+
+					// Проверяем подтверждение
+					if args != "confirm" {
+						msg.Text = "⚠️ **ВНИМАНИЕ!**\n\n" +
+							"Эта команда удалит ВСЕ ПРИЗЫ из Redis!\n" +
+							"Призы будут потеряны без возможности восстановления!\n\n" +
+							"Для подтверждения введите:\n" +
+							"`/removefromredis confirm`"
+						msg.ReplyToMessageID = update.Message.MessageID
 						break
 					}
 
