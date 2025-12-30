@@ -10,14 +10,15 @@ COPY go.mod go.sum ./
 # Загружаем зависимости
 RUN go mod download
 
-# Копируем исходный код
+# Копируем исходный код и файлы данных
 COPY main.go ./
+COPY prizes.json ./
 
 # Собираем приложение
 RUN CGO_ENABLED=0 GOOS=linux go build -o tg-random-bot main.go
 
 # Финальный образ на основе Alpine Linux
-FROM alpine:latest
+FROM alpine:3.19
 
 # Устанавливаем ca-certificates для HTTPS запросов
 RUN apk --no-cache add ca-certificates
@@ -28,8 +29,9 @@ RUN adduser -D -s /bin/sh appuser
 # Устанавливаем рабочую директорию
 WORKDIR /app
 
-# Копируем бинарный файл из builder образа
+# Копируем бинарный файл и файлы данных из builder образа
 COPY --from=builder /app/tg-random-bot .
+COPY --from=builder /app/prizes.json .
 
 # Меняем владельца файла на appuser
 RUN chown appuser:appuser tg-random-bot

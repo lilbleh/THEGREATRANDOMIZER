@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	crand "math/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -20,8 +21,9 @@ import (
 // Глобальный список участников (инициализируется при запуске)
 var participants []string
 
-// Текущая "плашка" для проигравшего
-var currentPrize = "ЧМО"
+// Глобальные переменные для плашек
+var prizes []Prize
+var currentPrize Prize
 
 // Структура для хранения ставки
 type Bet struct {
@@ -31,34 +33,112 @@ type Bet struct {
 	Amount          int
 }
 
+// Структура для приза
+type Prize struct {
+	ID          string `json:"id,omitempty"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Emoji       string `json:"emoji,omitempty"`
+	Rarity      string `json:"rarity"`
+	Cost        int    `json:"cost,omitempty"`
+}
+
+// Структура для конфига призов
+type PrizeConfig struct {
+	Prizes []Prize `json:"prizes"`
+}
+
+// Структура для элемента инвентаря
+type InventoryItem struct {
+	PrizeName string `json:"prizeName"`
+	Rarity    string `json:"rarity"`
+	Cost      int    `json:"cost"`
+	Count     int    `json:"count"`
+	Hash      string `json:"hash"` // Уникальный хэш предмета для продажи
+}
+
+// Rarity представляет редкость предмета
+type Rarity string
+
+const (
+	CommonRarity    Rarity = "common"
+	RareRarity      Rarity = "rare"
+	LegendaryRarity Rarity = "legendary"
+)
+
+// GenerateRandomRarity генерирует случайную редкость на основе вероятностей:
+// - Common: 0-79 (80% шанс)
+// - Rare: 80-94 (15% шанс)
+// - Legendary: 95-100 (6% шанс)
+func GenerateRandomRarity() Rarity {
+	// Генерируем криптографически безопасное случайное число от 0 до 100
+	max := big.NewInt(101) // 0-100 включительно
+	randomBig, err := rand.Int(rand.Reader, max)
+	if err != nil {
+		// В случае ошибки возвращаем common как fallback
+		return CommonRarity
+	}
+
+	randomNum := int(randomBig.Int64())
+
+	// Определяем редкость по диапазонам
+	switch {
+	case randomNum <= 79:
+		return CommonRarity
+	case randomNum <= 94:
+		return RareRarity
+	default:
+		return LegendaryRarity
+	}
+}
+
 // Переменные для управления игрой
 var gameMessageID int
 var gameChatID int64
 var isGameActive bool
+var gameInProgress bool  // Флаг, что идет процесс игры (чтобы предотвратить запуск нескольких игр)
+var gameCancel chan bool // Канал для отмены активной игры
 var totalRounds int
 var currentRound int
+var bettingPhase string
 
 // Переменные для управления ставками
 var initialBets = make(map[string]Bet)  // Ставки на начальном этапе (ключ: username игрока)
 var finalBets = make(map[string]Bet)    // Ставки на финальном этапе (ключ: username игрока)
-var bettingPhase string                 // "initial", "final", "closed"
 var bettingParticipants []string        // Участники для ставок (сортированные алфавитно)
 var initialBettingParticipants []string // Сохраняем первоначальный список для ставок
 var finalBettingNumbers []int           // Номера для финальных ставок
-var gameInProgress bool                 // Флаг, что игра в процессе выполнения
 
 // Map для хранения username/ID участников (ключ: имя, значение: user ID)
 // ТЕСТОВЫЙ СПИСОК ИЗ 5 УЧАСТНИКОВ
 var participantIDs = map[string]string{
-	"Алексей Баранов":  "barrrraaa",
-	"Глеб Гусев":       "hunnidstooblue",
-	"Юля Луцевич":      "iuliia_lutsevich",
-	"Василий Гончаров": "BroisHelmut",
-	"Никита Шакалов":   "iamnothiding",
+	"Арсений Квятковский": "Arsenkwait",
+	"Василий Гончаров":    "BroisHelmut",
+	"Виктория Григорьева": "sweerty_yv",
+	"Владислав Рыбаков":   "mbr3unk",
+	"Глеб Сушкевич":       "glbmsk",
+	"Дарья Шилина":        "quasarqs0",
+	"Екатерина Гнедова":   "Katharina_gn",
+	"Игнат Пикта":         "LilakGnatius",
+	"Максим Хваль":        "Whereisthesenses",
+	"Мария Князькова":     "tomazzeto",
+	"Назар Закревский":    "Zakrevski_05",
+	"Настя Павлюченко":    "kuvillin",
+	"Никита Янович":       "nktstrltz",
+	"Ольга Легостаева":    "legostaevaa",
+	"Ольга Васильева":     "olgavas8",
+	"Рома Болдырев":       "woistmeinemutter",
+	"Софья Цыбукова":      "Stelul003",
+	"Вероника Войтех":     "veronikavoiteh",
+	"Юля Луцевич":         "iuliia_lutsevich",
+	"Глеб Гусев":          "hunnidstooblue",
+	"Никита Шакалов":      "iamnothiding",
+	"Алексей Баранов":     "barrrraaa",
 }
 
 // Map для хранения хэшей участников (ключ: имя участника, значение: SHA-256 хэш)
 var participantHashes = make(map[string]string)
+var eliminatedParticipants []string // Выбывшие участники
 
 // Map для хранения балансов игроков (ключ: username, значение: баланс)
 var playerBalances = make(map[string]int)
@@ -81,6 +161,13 @@ func hashParticipant(name string) string {
 	return fmt.Sprintf("%x", hash)
 }
 
+// Функция для генерации хэша предмета инвентаря
+func generateItemHash(username, prizeName string) string {
+	data := fmt.Sprintf("%s:%s:%d", username, prizeName, time.Now().UnixNano())
+	hash := sha256.Sum256([]byte(data))
+	return fmt.Sprintf("%x", hash)[:6] // Берем первые 6 символов для короткого хэша
+}
+
 // Функция для инициализации хэшей всех участников
 func initParticipantHashes() {
 	for name, username := range participantIDs {
@@ -96,10 +183,41 @@ func formatParticipantName(name string) string {
 // Функция для форматирования имени участника с @username
 func formatParticipantNameWithUsername(name string) string {
 	username := participantIDs[name]
+	baseName := name
+
 	if username != "" {
-		return fmt.Sprintf("%s (@%s)", name, username)
+		baseName = fmt.Sprintf("%s (@%s)", name, username)
 	}
-	return name
+
+	// Проверяем, есть ли надетая плашка
+	if username != "" {
+		wornData, err := getWornItem(username)
+		if err == nil && wornData != nil {
+			// Добавляем плашку к имени
+			itemName := wornData["name"]
+			baseName = fmt.Sprintf("%s %s", baseName, itemName)
+		}
+	}
+
+	return baseName
+}
+
+// Функция для форматирования имени участника только с плашкой (без username)
+func formatParticipantNameWithItem(name string) string {
+	username := participantIDs[name]
+	baseName := name
+
+	// Проверяем, есть ли надетая плашка
+	if username != "" {
+		wornData, err := getWornItem(username)
+		if err == nil && wornData != nil {
+			// Добавляем плашку к имени
+			itemName := wornData["name"]
+			baseName = fmt.Sprintf("%s %s", baseName, itemName)
+		}
+	}
+
+	return baseName
 }
 
 // Функция для правильного склонения слова "фишка"
@@ -121,6 +239,125 @@ func getChipsWord(count int) string {
 	default:
 		return "фишек"
 	}
+}
+
+// Функция для надевания плашки пользователем
+func wearItem(username, itemHash string) error {
+	log.Printf("wearItem: Пользователь %s надевает плашку с хэшем %s", username, itemHash)
+
+	if redisClient == nil {
+		return fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+
+	// Проверяем, есть ли такой предмет у пользователя
+	itemKey := fmt.Sprintf("inventory:%s:%s", username, itemHash)
+	itemData, err := redisClient.Get(ctx, itemKey).Result()
+	if err != nil {
+		log.Printf("wearItem: Предмет с хэшем %s не найден у пользователя %s", itemHash, username)
+		return fmt.Errorf("предмет не найден в инвентаре")
+	}
+
+	// Парсим данные предмета
+	var item InventoryItem
+	err = json.Unmarshal([]byte(itemData), &item)
+	if err != nil {
+		log.Printf("wearItem: Ошибка парсинга предмета %s: %v", itemHash, err)
+		return fmt.Errorf("ошибка обработки предмета")
+	}
+
+	// Сохраняем информацию о надетой плашке
+	profileKey := fmt.Sprintf("profile:%s:worn_item", username)
+	wornData := map[string]string{
+		"hash":      itemHash,
+		"name":      item.PrizeName,
+		"rarity":    item.Rarity,
+		"timestamp": fmt.Sprintf("%d", time.Now().Unix()),
+	}
+
+	data, err := json.Marshal(wornData)
+	if err != nil {
+		log.Printf("wearItem: Ошибка маршалинга данных плашки: %v", err)
+		return fmt.Errorf("ошибка сохранения")
+	}
+
+	err = redisClient.Set(ctx, profileKey, data, 0).Err()
+	if err != nil {
+		log.Printf("wearItem: Ошибка сохранения надетой плашки: %v", err)
+		return fmt.Errorf("ошибка сохранения профиля")
+	}
+
+	log.Printf("wearItem: Плашка %s успешно надета пользователем %s", item.PrizeName, username)
+	return nil
+}
+
+// Функция для снятия плашки пользователем
+func unwearItem(username string) error {
+	log.Printf("unwearItem: Пользователь %s снимает плашку", username)
+
+	if redisClient == nil {
+		return fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	profileKey := fmt.Sprintf("profile:%s:worn_item", username)
+
+	// Проверяем, есть ли надетая плашка
+	exists, err := redisClient.Exists(ctx, profileKey).Result()
+	if err != nil {
+		log.Printf("unwearItem: Ошибка проверки профиля: %v", err)
+		return fmt.Errorf("ошибка проверки профиля")
+	}
+
+	if exists == 0 {
+		log.Printf("unwearItem: У пользователя %s нет надетой плашки", username)
+		return fmt.Errorf("нет надетой плашки")
+	}
+
+	// Удаляем информацию о надетой плашке
+	err = redisClient.Del(ctx, profileKey).Err()
+	if err != nil {
+		log.Printf("unwearItem: Ошибка удаления надетой плашки: %v", err)
+		return fmt.Errorf("ошибка снятия плашки")
+	}
+
+	log.Printf("unwearItem: Плашка успешно снята у пользователя %s", username)
+	return nil
+}
+
+// Функция для получения информации о надетой плашке
+func getWornItem(username string) (map[string]string, error) {
+	if redisClient == nil {
+		return nil, fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	profileKey := fmt.Sprintf("profile:%s:worn_item", username)
+
+	data, err := redisClient.Get(ctx, profileKey).Result()
+	if err != nil {
+		return nil, err // Возвращаем ошибку, если плашка не надета
+	}
+
+	var wornData map[string]string
+	err = json.Unmarshal([]byte(data), &wornData)
+	if err != nil {
+		log.Printf("getWornItem: Ошибка парсинга данных плашки для %s: %v", username, err)
+		return nil, err
+	}
+
+	return wornData, nil
+}
+
+// Функция для получения имени участника по username
+func getParticipantNameByUsername(username string) string {
+	for name, uname := range participantIDs {
+		if uname == username {
+			return name
+		}
+	}
+	return username // Если не найдено, возвращаем username
 }
 
 // Функция для выплаты выигрышей по ставкам и формирования текста результатов
@@ -172,18 +409,18 @@ func payoutWinnings(bot *tgbotapi.BotAPI, winner string, loser string) string {
 
 	log.Printf("payoutWinnings: Победитель %s имеет хэш %s (первые 5: %s)", winner, winnerHash, winnerHash[:5])
 
-	// Выплачиваем выигрыши по начальным ставкам (коэффициент x10)
+	// Выплачиваем выигрыши по начальным ставкам (коэффициент x30)
 	if len(initialBets) > 0 {
-		log.Printf("payoutWinnings: 🎯 Обрабатываем начальные ставки (x10), количество: %d", len(initialBets))
-		resultsText += "💰 *Начальные ставки (x10):*\n"
+		log.Printf("payoutWinnings: 🎯 Обрабатываем начальные ставки (x30), количество: %d", len(initialBets))
+		resultsText += "💰 *Начальные ставки (x30):*\n"
 		log.Printf("payoutWinnings: Начальные ставки найдены, добавляем в resultsText")
 		for username, bet := range initialBets {
 			log.Printf("payoutWinnings: Проверяем начальную ставку %s: ставка на %s (хэш %s), сумма %d", username, bet.ParticipantName, bet.ParticipantHash[:8]+"...", bet.Amount)
 			log.Printf("payoutWinnings: Победитель: %s (хэш %s)", winner, winnerHash[:8]+"...")
 
 			if bet.ParticipantName == winner {
-				// Ставка выиграла! Выплачиваем 10 фишек
-				winnings := bet.Amount * 10
+				// Ставка выиграла! Выплачиваем 30 фишек
+				winnings := bet.Amount * 30
 				log.Printf("payoutWinnings: Начальная ставка выиграла! %s ставил на %s, выигрыш %d фишек", username, bet.ParticipantName, winnings)
 				oldBalance := playerBalances[username]
 				changeBalance(username, winnings)
@@ -258,6 +495,39 @@ func payoutWinnings(bot *tgbotapi.BotAPI, winner string, loser string) string {
 		log.Printf("payoutWinnings: Redis клиент недоступен, ставки очищены только в памяти")
 	}
 
+	// Выдаем приз победителю - используем плашку, выбранную в начале игры
+	log.Printf("payoutWinnings: Выдаем приз победителю %s", winner)
+	log.Printf("payoutWinnings: Используем плашку из игры: %s (%s)", currentPrize.Name, currentPrize.Rarity)
+
+	if currentPrize.Name == "" {
+		log.Printf("payoutWinnings: ОШИБКА: currentPrize пустой!")
+		resultsText += fmt.Sprintf("\n\n🎁 Ошибка: плашка не была выбрана!")
+	} else {
+		// Находим username победителя
+		winnerUsername := participantIDs[winner]
+		log.Printf("payoutWinnings: participantIDs содержит %d записей", len(participantIDs))
+		for name, uname := range participantIDs {
+			log.Printf("payoutWinnings: participantIDs[%s] = %s", name, uname)
+		}
+		log.Printf("payoutWinnings: Ищем username для winner='%s'", winner)
+		winnerUsername = participantIDs[winner]
+		log.Printf("payoutWinnings: Победитель %s, username: %s", winner, winnerUsername)
+
+		if winnerUsername == "" {
+			log.Printf("payoutWinnings: ОШИБКА: username победителя пустой!")
+			resultsText += fmt.Sprintf("\n\n🎁 Ошибка определения победителя!")
+		} else {
+			err := givePrizeToWinner(winnerUsername, currentPrize)
+			if err != nil {
+				log.Printf("payoutWinnings: Ошибка выдачи приза: %v", err)
+				resultsText += fmt.Sprintf("\n\n🎁 Ошибка выдачи приза!")
+			} else {
+				log.Printf("payoutWinnings: Приз %s успешно выдан победителю %s", currentPrize.Name, winnerUsername)
+				resultsText += fmt.Sprintf("\n\n🎁 Победитель получает плашку: **%s**!", currentPrize.Name)
+			}
+		}
+	}
+
 	log.Printf("payoutWinnings: === ВЫПЛАТА ВЫИГРЫШЕЙ ЗАВЕРШЕНА ===")
 	previewLen := 100
 	if len(resultsText) < previewLen {
@@ -279,7 +549,20 @@ func performGameRound(bot *tgbotapi.BotAPI, roundNumber int) string {
 		// Финальный раунд: последний участник выигрывает
 		winner := participants[0]
 
-		finalText := fmt.Sprintf("🏆🏆🏆 %s, ПОЗДРАВЛЯЕМ!! Вы выиграли плашку \"%s\"!\n\n🐩 Игра окончена!", formatParticipantNameWithUsername(winner), currentPrize)
+		// Показываем полную информацию о выигранной плашке
+		rarityText := ""
+		switch currentPrize.Rarity {
+		case "common":
+			rarityText = "ОБЫЧНАЯ"
+		case "rare":
+			rarityText = "РЕДКАЯ"
+		case "legendary":
+			rarityText = "ЛЕГЕНДАРНАЯ"
+		default:
+			rarityText = "НЕИЗВЕСТНАЯ"
+		}
+
+		finalText := fmt.Sprintf("🏆🏆🏆 %s, ПОЗДРАВЛЯЕМ!! Вы выиграли плашку \"%s\" (%s)!\n\n🐩 Игра окончена!", formatParticipantNameWithUsername(winner), currentPrize.Name, rarityText)
 		participants = []string{} // Полностью очищаем список
 		isGameActive = false
 		return finalText
@@ -293,7 +576,7 @@ func performGameRound(bot *tgbotapi.BotAPI, roundNumber int) string {
 		finalRoundText := "🎯 ФИНАЛЬНЫЙ РАУНД!\n\n"
 		finalRoundText += "🏆 ФИНАЛИСТЫ:\n"
 		for i, participant := range participants {
-			finalRoundText += fmt.Sprintf("%d - %s\n", i+1, formatParticipantNameWithUsername(participant))
+			finalRoundText += fmt.Sprintf("%d - %s\n", i+1, formatParticipantNameWithItem(participant))
 		}
 		finalRoundText += "\n⏰ Через 5 секунд начнутся финальные ставки!"
 
@@ -304,8 +587,13 @@ func performGameRound(bot *tgbotapi.BotAPI, roundNumber int) string {
 		}
 
 		log.Printf("performGameRound: Ждем 5 секунд финального раунда...")
-		time.Sleep(5 * time.Second)
-		log.Printf("performGameRound: Финальный раунд завершен")
+		select {
+		case <-time.After(5 * time.Second):
+			log.Printf("performGameRound: Финальный раунд завершен")
+		case <-gameCancel:
+			log.Printf("performGameRound: Финальный раунд отменен")
+			return "Игра была отменена"
+		}
 
 		// ФАЗА 2: Финальные ставки (30 секунд)
 		log.Printf("performGameRound: ФАЗА 2 - Запускаем финальные ставки на 30 секунд")
@@ -319,13 +607,12 @@ func performGameRound(bot *tgbotapi.BotAPI, roundNumber int) string {
 		finalBetText := "🎯 ФИНАЛЬНЫЕ СТАВКИ!\n\n"
 		finalBetText += "🏆 ОСТАЛИСЬ ДВА УЧАСТНИКА:\n"
 		for i, participant := range bettingParticipants {
-			finalBetText += fmt.Sprintf("%d - %s\n", i+1, formatParticipantNameWithUsername(participant))
+			finalBetText += fmt.Sprintf("%d - %s\n", i+1, formatParticipantNameWithItem(participant))
 		}
 		finalBetText += "\n💰 ФИНАЛЬНЫЕ СТАВКИ ОТКРЫТЫ!\n"
 		finalBetText += "🎯 Ставьте на победителя: /bet N СУММА\n"
 		finalBetText += "💎 Коэффициент: x2\n"
 		finalBetText += "⏰ Время на ставки: 30 сек\n"
-		finalBetText += "\n❌ ВНИМАНИЕ: Кто уже ставил в начале игры - ставку сделать НЕЛЬЗЯ!"
 
 		// Отправляем новое сообщение вместо редактирования старого
 		betMsg := tgbotapi.NewMessage(gameChatID, finalBetText)
@@ -364,7 +651,20 @@ func performGameRound(bot *tgbotapi.BotAPI, roundNumber int) string {
 		finalResultText := fmt.Sprintf("☹️ К сожалению! %s не получает плашку в финале!\n", formatParticipantNameWithUsername(loser))
 		finalResultText += "ничего страшного, повезет в следующей игре 🍀!\n\n"
 
-		finalResultText += fmt.Sprintf("🏆🏆🏆 %s, ПОЗДРАВЛЯЕМ!! Вы выиграли плашку \"%s\"!\n", formatParticipantNameWithUsername(winner), currentPrize)
+		// Показываем полную информацию о выигранной плашке
+		rarityText := ""
+		switch currentPrize.Rarity {
+		case "common":
+			rarityText = "ОБЫЧНАЯ"
+		case "rare":
+			rarityText = "РЕДКАЯ"
+		case "legendary":
+			rarityText = "ЛЕГЕНДАРНАЯ"
+		default:
+			rarityText = "НЕИЗВЕСТНАЯ"
+		}
+
+		finalResultText += fmt.Sprintf("🏆🏆🏆 %s, ПОЗДРАВЛЯЕМ!! Вы выиграли плашку \"%s\" (%s)!\n", formatParticipantNameWithUsername(winner), currentPrize.Name, rarityText)
 
 		finalResultText += "\n\n🐩 Игра окончена!"
 
@@ -411,27 +711,60 @@ func performGameRound(bot *tgbotapi.BotAPI, roundNumber int) string {
 		log.Printf("performGameRound: payoutWinnings завершен")
 		log.Printf("performGameRound: === ФИНАЛЬНАЯ ИГРА ЗАВЕРШЕНА ===")
 
-		return finalResultText
+		return ""
 	} else {
 		// Обычный раунд: выбираем случайного участника для удаления
 		randomIndex, _ := rand.Int(rand.Reader, big.NewInt(int64(len(participants))))
 		loserIndex := int(randomIndex.Int64())
 		removedParticipant := participants[loserIndex]
 
-		// Удаляем участника из списка
+		// Добавляем в список выбывших и удаляем из активных участников
+		eliminatedParticipants = append(eliminatedParticipants, removedParticipant)
 		participants = append(participants[:loserIndex], participants[loserIndex+1:]...)
 
-		roundText := fmt.Sprintf("☹️ К сожалению участник %s не получает плашку в этом туре!\n", formatParticipantName(removedParticipant))
-		roundText += "@" + participantIDs[removedParticipant] + ", ничего страшного, повезет в следующей игре 😊🍀!\n"
+		// Формируем полное обновляемое сообщение
+		gameText := "🎮 ИГРА ИДЁТ!\n\n"
+
+		// Показываем редкость будущей плашки
+		rarityText := ""
+		switch currentPrize.Rarity {
+		case "common":
+			rarityText = "ОБЫЧНАЯ"
+		case "rare":
+			rarityText = "РЕДКАЯ"
+		case "legendary":
+			rarityText = "ЛЕГЕНДАРНАЯ"
+		}
+		gameText += fmt.Sprintf("🎁 БУДЕТ РАЗЫГРАНА %s ПЛАШКА!\n\n", rarityText)
+
+		// Текущие участники
+		if len(participants) > 0 {
+			gameText += "🏆 ТЕКУЩИЕ УЧАСТНИКИ:\n"
+			for i, participant := range participants {
+				gameText += fmt.Sprintf("%d - %s\n", i+1, formatParticipantNameWithItem(participant))
+			}
+		}
+
+		// Выбывшие участники
+		if len(eliminatedParticipants) > 0 {
+			gameText += "\n💀 ВЫБЫВШИЕ УЧАСТНИКИ:\n"
+			for _, participant := range eliminatedParticipants {
+				gameText += fmt.Sprintf("❌ %s\n", formatParticipantNameWithItem(participant))
+			}
+		}
+
+		// Сообщение о выбывшем участнике
+		gameText += fmt.Sprintf("\n☹️ В этом раунде выбывает: %s\n", formatParticipantName(removedParticipant))
+		gameText += "@" + participantIDs[removedParticipant] + ", ничего страшного, повезет в следующей игре 😊🍀!\n"
 
 		remaining := len(participants)
 		if remaining > 1 {
-			roundText += fmt.Sprintf("\nОсталось участников: %d", remaining)
+			gameText += fmt.Sprintf("\nОсталось участников: %d", remaining)
 		} else if remaining == 1 {
-			roundText += "\n🏆 Остался последний участник!"
+			gameText += "\n🏆 Остался последний участник!"
 		}
 
-		return roundText
+		return gameText
 	}
 }
 
@@ -441,6 +774,15 @@ func runGameSession(bot *tgbotapi.BotAPI) {
 
 	// Цикл для всех раундов
 	for isGameActive && currentRound <= totalRounds {
+		// Проверяем, не была ли игра отменена
+		select {
+		case <-gameCancel:
+			log.Printf("runGameSession: Игра отменена во время выполнения")
+			return
+		default:
+			// Продолжаем игру
+		}
+
 		log.Printf("runGameSession: НАЧАЛО РАУНДА %d (%d-й по порядку), isGameActive=%t, len(participants)=%d", currentRound, currentRound+1, isGameActive, len(participants))
 
 		// Выполняем раунд
@@ -450,24 +792,31 @@ func runGameSession(bot *tgbotapi.BotAPI) {
 		// Если игра закончилась, показываем финальный результат
 		if !isGameActive {
 			log.Printf("Игра закончилась после раунда %d", currentRound)
-			log.Printf("runGameSession: Отправляем финальное сообщение: %s", roundResult)
-			editMsg := tgbotapi.NewEditMessageText(gameChatID, gameMessageID, roundResult)
-			_, err := bot.Send(editMsg)
-			if err != nil {
-				log.Printf("runGameSession: Ошибка отправки финального сообщения: %v", err)
-			} else {
-				log.Printf("runGameSession: Финальное сообщение отправлено успешно")
+			// Для финальной игры результаты уже отправлены отдельными сообщениями
+			if roundResult != "" {
+				log.Printf("runGameSession: Отправляем финальное сообщение: %s", roundResult)
+				editMsg := tgbotapi.NewEditMessageText(gameChatID, gameMessageID, roundResult)
+				_, err := bot.Send(editMsg)
+				if err != nil {
+					log.Printf("runGameSession: Ошибка отправки финального сообщения: %v", err)
+				} else {
+					log.Printf("runGameSession: Финальное сообщение отправлено успешно")
+				}
 			}
-			gameInProgress = false
-			log.Printf("runGameSession: gameInProgress установлен в false")
+			log.Printf("runGameSession: игра завершена")
 			return
 		}
 
-		// Показываем результат раунда
+		// Проверяем, последний ли это раунд
 		if currentRound >= totalRounds {
-			// Последний раунд - просто показываем результат
-			editMsg := tgbotapi.NewEditMessageText(gameChatID, gameMessageID, roundResult)
-			bot.Send(editMsg)
+			// Последний раунд - показываем результат и завершаем
+			log.Printf("runGameSession: Последний раунд %d завершен", currentRound)
+			if roundResult != "" {
+				editMsg := tgbotapi.NewEditMessageText(gameChatID, gameMessageID, roundResult)
+				if _, err := bot.Send(editMsg); err != nil {
+					log.Printf("runGameSession: Ошибка отправки сообщения последнего раунда: %v", err)
+				}
+			}
 			currentRound++
 			break
 		}
@@ -484,8 +833,14 @@ func runGameSession(bot *tgbotapi.BotAPI) {
 			break
 		}
 
-		// Ждём 5 секунд до следующего раунда
-		time.Sleep(5 * time.Second)
+		// Ждём 5 секунд до следующего раунда с проверкой отмены
+		select {
+		case <-time.After(5 * time.Second):
+			// Время вышло, продолжаем
+		case <-gameCancel:
+			log.Printf("runGameSession: Игра отменена во время паузы между раундами")
+			return
+		}
 
 		currentRound++
 		log.Printf("runGameSession: Переходим к раунду %d", currentRound)
@@ -495,7 +850,20 @@ func runGameSession(bot *tgbotapi.BotAPI) {
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
+
 	log.Printf("runGameSession: Цикл завершен, isGameActive=%t, currentRound=%d, totalRounds=%d", isGameActive, currentRound, totalRounds)
+
+	// Сбрасываем состояние после завершения игры
+	if !isGameActive {
+		log.Printf("runGameSession: Игра завершена, сбрасываем состояние")
+		bettingPhase = "closed"
+		currentRound = 0
+		initialBets = make(map[string]Bet)
+		finalBets = make(map[string]Bet)
+		finalBettingNumbers = []int{}
+		currentPrize = Prize{}
+		gameInProgress = false // Сбрасываем флаг процесса игры
+	}
 }
 
 // Функция для инициализации Redis клиента
@@ -535,6 +903,26 @@ func saveBalanceToRedis(username string, balance int) {
 	if err != nil {
 		log.Printf("Ошибка сохранения баланса для %s: %v", username, err)
 	}
+}
+
+// Функция для сохранения всех балансов в Redis
+func saveBalancesToRedis() error {
+	if redisClient == nil {
+		return fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	for username, balance := range playerBalances {
+		key := fmt.Sprintf("balance:%s", username)
+		err := redisClient.Set(ctx, key, balance, 0).Err()
+		if err != nil {
+			log.Printf("Ошибка сохранения баланса для %s: %v", username, err)
+			return fmt.Errorf("failed to save balance for %s: %v", username, err)
+		}
+	}
+
+	log.Printf("saveBalancesToRedis: Сохранено %d балансов в Redis", len(playerBalances))
+	return nil
 }
 
 // Функция для загрузки баланса из Redis
@@ -654,6 +1042,306 @@ func loadBetsFromRedis(key string) (map[string]Bet, error) {
 	return bets, nil
 }
 
+// Функция для сохранения приза в Redis
+func savePrizeToRedis(prize Prize) error {
+	if redisClient == nil {
+		return fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	key := fmt.Sprintf("prize:%s", prize.Name)
+
+	data, err := json.Marshal(prize)
+	if err != nil {
+		return fmt.Errorf("failed to marshal prize: %v", err)
+	}
+
+	err = redisClient.Set(ctx, key, data, 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to save prize to Redis: %v", err)
+	}
+
+	return nil
+}
+
+// Функция для загрузки приза из Redis
+func loadPrizeFromRedis(name string) (Prize, error) {
+	if redisClient == nil {
+		return Prize{}, fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	key := fmt.Sprintf("prize:%s", name)
+
+	val, err := redisClient.Get(ctx, key).Result()
+	if err != nil {
+		return Prize{}, fmt.Errorf("failed to get prize from Redis: %v", err)
+	}
+
+	var prize Prize
+	err = json.Unmarshal([]byte(val), &prize)
+	if err != nil {
+		return Prize{}, fmt.Errorf("failed to unmarshal prize: %v", err)
+	}
+
+	return prize, nil
+}
+
+// Функция для загрузки всех призов из Redis
+func loadAllPrizesFromRedis() ([]Prize, error) {
+	if redisClient == nil {
+		return nil, fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	keys, err := redisClient.Keys(ctx, "prize:*").Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get prize keys: %v", err)
+	}
+
+	var prizes []Prize
+	for _, key := range keys {
+		val, err := redisClient.Get(ctx, key).Result()
+		if err != nil {
+			log.Printf("Warning: failed to get prize %s: %v", key, err)
+			continue
+		}
+
+		var prize Prize
+		err = json.Unmarshal([]byte(val), &prize)
+		if err != nil {
+			log.Printf("Warning: failed to unmarshal prize %s: %v", key, err)
+			continue
+		}
+
+		prizes = append(prizes, prize)
+	}
+
+	return prizes, nil
+}
+
+// Функция для удаления всех призов из Redis
+func removeAllPrizesFromRedis() error {
+	if redisClient == nil {
+		return fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	keys, err := redisClient.Keys(ctx, "prize:*").Result()
+	if err != nil {
+		return fmt.Errorf("failed to get prize keys: %v", err)
+	}
+
+	if len(keys) == 0 {
+		return nil // Нет ключей для удаления
+	}
+
+	err = redisClient.Del(ctx, keys...).Err()
+	if err != nil {
+		return fmt.Errorf("failed to delete prizes from Redis: %v", err)
+	}
+
+	log.Printf("Удалено %d призов из Redis", len(keys))
+	return nil
+}
+
+// Функция для загрузки призов из JSON файла в Redis
+func loadPrizesFromFileToRedis() error {
+	// Загружаем призы из файла
+	data, err := os.ReadFile("prizes.json")
+	if err != nil {
+		return fmt.Errorf("failed to read prizes.json: %v", err)
+	}
+
+	var config PrizeConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("failed to parse prizes.json: %v", err)
+	}
+
+	// Сохраняем каждый приз в Redis
+	for _, prize := range config.Prizes {
+		if err := savePrizeToRedis(prize); err != nil {
+			log.Printf("Warning: failed to save prize %s: %v", prize.Name, err)
+		}
+	}
+
+	log.Printf("Загружено %d призов в Redis из prizes.json", len(config.Prizes))
+	return nil
+}
+
+// Функция для выдачи приза победителю
+func givePrizeToWinner(winnerUsername string, prize Prize) error {
+	log.Printf("givePrizeToWinner: Начинаем выдачу приза %s игроку %s", prize.Name, winnerUsername)
+
+	if redisClient == nil {
+		log.Printf("givePrizeToWinner: Redis client not available")
+		return fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+
+	// Генерируем уникальный хэш для этого предмета
+	itemHash := generateItemHash(winnerUsername, prize.Name)
+	key := fmt.Sprintf("inventory:%s:%s", winnerUsername, itemHash)
+	log.Printf("givePrizeToWinner: Используем ключ %s для нового предмета", key)
+
+	// Создаем новый элемент инвентаря
+	item := InventoryItem{
+		PrizeName: prize.Name,
+		Rarity:    prize.Rarity,
+		Cost:      prize.Cost,
+		Count:     1, // Каждый предмет хранится отдельно
+		Hash:      itemHash,
+	}
+
+	// Сохраняем в Redis
+	data, err := json.Marshal(item)
+	if err != nil {
+		log.Printf("givePrizeToWinner: Ошибка маршалинга: %v", err)
+		return fmt.Errorf("failed to marshal inventory item: %v", err)
+	}
+
+	err = redisClient.Set(ctx, key, data, 0).Err()
+	if err != nil {
+		log.Printf("givePrizeToWinner: Ошибка сохранения в Redis: %v", err)
+		return fmt.Errorf("failed to save inventory item: %v", err)
+	}
+
+	log.Printf("givePrizeToWinner: Приз %s успешно выдан игроку %s (хэш: %s)", prize.Name, winnerUsername, itemHash)
+
+	// Проверяем, что предмет действительно сохранен
+	_, testErr := redisClient.Get(ctx, key).Result()
+	if testErr != nil {
+		log.Printf("givePrizeToWinner: ОШИБКА: не удалось проверить сохраненный предмет: %v", testErr)
+	} else {
+		log.Printf("givePrizeToWinner: Проверка пройдена - предмет сохранен под ключом %s", key)
+	}
+
+	return nil
+}
+
+// Функция для получения инвентаря игрока
+func getPlayerInventory(username string) ([]InventoryItem, error) {
+	log.Printf("getPlayerInventory: Получаем инвентарь для пользователя %s", username)
+
+	if redisClient == nil {
+		log.Printf("getPlayerInventory: Redis client not available")
+		return nil, fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	pattern := fmt.Sprintf("inventory:%s:*", username)
+	log.Printf("getPlayerInventory: Ищем ключи по паттерну %s", pattern)
+
+	keys, err := redisClient.Keys(ctx, pattern).Result()
+	if err != nil {
+		log.Printf("getPlayerInventory: Ошибка получения ключей: %v", err)
+		return nil, fmt.Errorf("failed to get inventory keys: %v", err)
+	}
+
+	log.Printf("getPlayerInventory: Найдено %d ключей: %v", len(keys), keys)
+
+	var inventory []InventoryItem
+	for _, key := range keys {
+		log.Printf("getPlayerInventory: Обрабатываем ключ %s", key)
+		val, err := redisClient.Get(ctx, key).Result()
+		if err != nil {
+			log.Printf("getPlayerInventory: Ошибка получения значения для ключа %s: %v", key, err)
+			continue
+		}
+
+		log.Printf("getPlayerInventory: Значение для ключа %s: %s", key, val)
+
+		var item InventoryItem
+		err = json.Unmarshal([]byte(val), &item)
+		if err != nil {
+			log.Printf("getPlayerInventory: Ошибка распаковки для ключа %s: %v", key, err)
+			continue
+		}
+
+		log.Printf("getPlayerInventory: Добавляем предмет: %s (хэш: %s)", item.PrizeName, item.Hash)
+		inventory = append(inventory, item)
+	}
+
+	log.Printf("getPlayerInventory: Возвращаем %d предметов", len(inventory))
+	return inventory, nil
+}
+
+// Функция для получения всех экземпляров предмета игрока (для продажи)
+func getPlayerItemInstances(username, prizeName string) ([]InventoryItem, error) {
+	log.Printf("getPlayerItemInstances: Получаем все экземпляры %s для пользователя %s", prizeName, username)
+
+	if redisClient == nil {
+		return nil, fmt.Errorf("Redis client not available")
+	}
+
+	ctx := context.Background()
+	pattern := fmt.Sprintf("inventory:%s:*", username)
+
+	keys, err := redisClient.Keys(ctx, pattern).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get inventory keys: %v", err)
+	}
+
+	var instances []InventoryItem
+	for _, key := range keys {
+		val, err := redisClient.Get(ctx, key).Result()
+		if err != nil {
+			continue
+		}
+
+		var item InventoryItem
+		err = json.Unmarshal([]byte(val), &item)
+		if err != nil {
+			continue
+		}
+
+		// Ищем предметы с нужным именем
+		if item.PrizeName == prizeName {
+			instances = append(instances, item)
+		}
+	}
+
+	log.Printf("getPlayerItemInstances: Найдено %d экземпляров предмета %s", len(instances), prizeName)
+	return instances, nil
+}
+
+// Функция для выбора случайного приза по редкости
+func selectRandomPrizeByRarity(rarity Rarity) (Prize, error) {
+	log.Printf("selectRandomPrizeByRarity: Выбираем приз для редкости %s", rarity)
+
+	// Загружаем все призы из Redis
+	prizes, err := loadAllPrizesFromRedis()
+	if err != nil {
+		log.Printf("selectRandomPrizeByRarity: Ошибка загрузки призов: %v", err)
+		return Prize{}, fmt.Errorf("failed to load prizes: %v", err)
+	}
+
+	log.Printf("selectRandomPrizeByRarity: Загружено %d призов из Redis", len(prizes))
+
+	// Фильтруем призы по редкости
+	var filteredPrizes []Prize
+	for _, prize := range prizes {
+		if prize.Rarity == string(rarity) {
+			filteredPrizes = append(filteredPrizes, prize)
+		}
+	}
+
+	log.Printf("selectRandomPrizeByRarity: Найдено %d призов для редкости %s", len(filteredPrizes), rarity)
+
+	if len(filteredPrizes) == 0 {
+		log.Printf("selectRandomPrizeByRarity: Не найдено призов для редкости %s", rarity)
+		return Prize{}, fmt.Errorf("no prizes found for rarity %s", rarity)
+	}
+
+	// Выбираем случайный приз из отфильтрованных
+	randomIndex := crand.Intn(len(filteredPrizes))
+	selectedPrize := filteredPrizes[randomIndex]
+
+	log.Printf("selectRandomPrizeByRarity: Выбрана плашка '%s' (индекс %d из %d)", selectedPrize.Name, randomIndex, len(filteredPrizes))
+	return selectedPrize, nil
+}
+
 // Функция для безопасного изменения баланса (гарантирует отсутствие отрицательных значений)
 func changeBalance(username string, amount int) bool {
 	log.Printf("changeBalance: Попытка изменить баланс %s на %d", username, amount)
@@ -728,6 +1416,9 @@ func promoteUserToAdmin(bot *tgbotapi.BotAPI, chatID int64, userID int64) {
 func main() {
 	log.Printf("🚀 === ЗАПУСК БОТА ===")
 
+	// Инициализируем канал отмены игры
+	gameCancel = make(chan bool, 1)
+
 	// Инициализируем Redis клиент
 	log.Printf("main: Инициализируем Redis клиент")
 	initRedis()
@@ -767,11 +1458,19 @@ func main() {
 	shuffleParticipants()
 	log.Printf("main: Участники после перемешивания: %v", participants)
 
+	// Загружаем призы из файла в Redis при запуске
+	log.Printf("main: Загружаем призы из prizes.json в Redis")
+	if err := loadPrizesFromFileToRedis(); err != nil {
+		log.Printf("Ошибка загрузки призов: %v", err)
+		log.Printf("main: Продолжаем без призов, будет использоваться дефолтная плашка")
+	} else {
+		log.Printf("main: Призы успешно загружены")
+	}
+
 	// Инициализируем переменные ставок
 	bettingPhase = "closed"
 	bettingParticipants = []string{}
 	finalBettingNumbers = []int{}
-	gameInProgress = false
 
 	bot.Debug = true
 
@@ -785,9 +1484,12 @@ func main() {
 
 	// Обрабатываем обновления
 	for update := range updates {
+		log.Printf("Получено обновление: %v", update.UpdateID)
 		if update.Message != nil { // Если это сообщение
+			log.Printf("Получено сообщение от %s: %s", update.Message.From.UserName, update.Message.Text)
 			// Проверяем, является ли сообщение командой
 			if update.Message.IsCommand() {
+				log.Printf("Обработка команды: %s от %s", update.Message.Command(), update.Message.From.UserName)
 				// Проверяем доступ пользователя - теперь проверка идет внутри команд
 				userName := update.Message.From.UserName
 
@@ -795,7 +1497,8 @@ func main() {
 
 				switch update.Message.Command() {
 				case "bet":
-					log.Printf("🎯 Команда /bet от %s: isGameActive=%t, bettingPhase=%s, gameInProgress=%t", userName, isGameActive, bettingPhase, gameInProgress)
+					log.Printf("🎯 Команда /bet от %s: isGameActive=%t, bettingPhase=%s", userName, isGameActive, bettingPhase)
+
 					// Проверяем, что игра активна
 					if !isGameActive {
 						log.Printf("❌ Ставка отклонена: игра не активна (isGameActive=false)")
@@ -814,14 +1517,16 @@ func main() {
 					// Получаем аргументы команды
 					args := update.Message.CommandArguments()
 					if args == "" {
-						msg.Text = "🚫 Укажите номер участника и сумму ставки! Пример: /bet 1 100"
+						msg.Text = "🚫 Укажите номер участника и сумму ставки! Пример: /bet 1 100 или /bet 1 all"
+						msg.ReplyToMessageID = update.Message.MessageID
 						break
 					}
 
 					// Парсим аргументы
 					parts := strings.Split(strings.TrimSpace(args), " ")
 					if len(parts) != 2 {
-						msg.Text = "🚫 Укажите номер участника и сумму ставки через пробел! Пример: /bet 1 100"
+						msg.Text = "🚫 Укажите номер участника и сумму ставки через пробел! Пример: /bet 1 100 или /bet 1 all"
+						msg.ReplyToMessageID = update.Message.MessageID
 						break
 					}
 
@@ -829,6 +1534,7 @@ func main() {
 					participantN, err := strconv.Atoi(strings.TrimSpace(parts[0]))
 					if err != nil {
 						msg.Text = "🚫 Неверный формат номера участника!"
+						msg.ReplyToMessageID = update.Message.MessageID
 						break
 					}
 
@@ -837,6 +1543,7 @@ func main() {
 					if bettingPhase == "initial" {
 						if participantN < 1 || participantN > len(bettingParticipants) {
 							msg.Text = fmt.Sprintf("🚫 Неверный номер участника! Доступные номера: 1-%d", len(bettingParticipants))
+							msg.ReplyToMessageID = update.Message.MessageID
 							break
 						}
 						participantName = bettingParticipants[participantN-1]
@@ -867,20 +1574,26 @@ func main() {
 					}
 
 					// Парсим сумму ставки
-					betAmount, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-					if err != nil || betAmount <= 0 {
-						msg.Text = "🚫 Укажите корректную положительную сумму ставки!"
-						break
-					}
+					var betAmount int
+					amountStr := strings.TrimSpace(parts[1])
 
-					// Проверяем, что пользователь еще не ставил НИКОГДА (ни в начальной, ни в финальной фазе)
-					if _, alreadyBetInitial := initialBets[userName]; alreadyBetInitial {
-						msg.Text = "🚫 Вы уже сделали ставку в начале игры! Ставку можно сделать только один раз за всю игру."
-						break
-					}
-					if _, alreadyBetFinal := finalBets[userName]; alreadyBetFinal {
-						msg.Text = "🚫 Вы уже сделали ставку в финальной фазе! Ставку можно сделать только один раз за всю игру."
-						break
+					if strings.ToLower(amountStr) == "all" {
+						// Ставим все деньги
+						if balance, exists := playerBalances[userName]; exists && balance > 0 {
+							betAmount = balance
+							log.Printf("🎯 Ставка ALL: пользователь %s ставит все деньги (%d фишек)", userName, betAmount)
+						} else {
+							msg.Text = "🚫 У вас нет денег для ставки!"
+							break
+						}
+					} else {
+						// Парсим обычную сумму
+						var err error
+						betAmount, err = strconv.Atoi(amountStr)
+						if err != nil || betAmount <= 0 {
+							msg.Text = "🚫 Укажите корректную положительную сумму ставки или 'all'!"
+							break
+						}
 					}
 
 					// Проверяем баланс пользователя
@@ -923,18 +1636,11 @@ func main() {
 					msg.ReplyToMessageID = update.Message.MessageID
 
 				case "game":
-					log.Printf("🎮 Команда /game получена от %s, chatID=%d", userName, update.Message.Chat.ID)
-					log.Printf("game: Состояние игры - isGameActive=%t, gameInProgress=%t, len(participants)=%d", isGameActive, gameInProgress, len(participants))
-					// Временно убираем проверку администратора для тестирования
-					// if userName != "hunnidstooblue" && userName != "iamnothiding" {
-					//     log.Printf("Пользователь %s не является администратором", userName)
-					//     msg.Text = "🚫 Только администраторы могут управлять игрой!"
-					//     break
-					// }
-
-					// Проверяем, не запущена ли уже игра
+					// Проверяем, не запущена ли уже игра или идет процесс завершения
+					log.Printf("Команда /game: isGameActive=%t, gameInProgress=%t", isGameActive, gameInProgress)
 					if isGameActive || gameInProgress {
-						msg.Text = "🎮 Игра уже запущена!"
+						msg.Text = "Для запуска игры нужно сделать /reset"
+						log.Printf("Команда /game: Отклонена - игра уже активна")
 						break
 					}
 
@@ -948,7 +1654,20 @@ func main() {
 					initialBets = make(map[string]Bet)
 					finalBets = make(map[string]Bet)
 					finalBettingNumbers = []int{}
-					gameInProgress = true
+
+					// Устанавливаем фазу ставок
+					bettingPhase = "initial"
+
+					// Выбираем плашку для этой игры (всегда новая при каждом запуске)
+					rarity := GenerateRandomRarity()
+					selectedPrize, err := selectRandomPrizeByRarity(rarity)
+					if err != nil {
+						log.Printf("Ошибка выбора плашки: %v, используем дефолтную", err)
+						currentPrize = Prize{Name: "ЧМО", Rarity: "common", Cost: 300}
+					} else {
+						currentPrize = selectedPrize
+						log.Printf("Выбрана плашка для игры: %s (%s редкость)", currentPrize.Name, currentPrize.Rarity)
+					}
 
 					// Создаем отсортированный список участников для ставок (по фамилии)
 					bettingParticipants = make([]string, len(participants))
@@ -984,13 +1703,26 @@ func main() {
 
 					// Создаем сообщение со списком участников для ставок
 					gameText := "🎮 НАЧИНАЕМ ИГРУ!\n\n"
+
+					// Показываем редкость будущей плашки
+					rarityText := ""
+					switch currentPrize.Rarity {
+					case "common":
+						rarityText = "ОБЫЧНАЯ"
+					case "rare":
+						rarityText = "РЕДКАЯ"
+					case "legendary":
+						rarityText = "ЛЕГЕНДАРНАЯ"
+					}
+					gameText += fmt.Sprintf("🎁 БУДЕТ РАЗЫГРАНА %s ПЛАШКА!\n\n", rarityText)
+
 					gameText += "🏆 УЧАСТНИКИ:\n"
 					for i, participant := range bettingParticipants {
-						gameText += fmt.Sprintf("%d - %s\n", i+1, formatParticipantNameWithUsername(participant))
+						gameText += fmt.Sprintf("%d - %s\n", i+1, formatParticipantNameWithItem(participant))
 					}
 					gameText += "\n💰 РАУНД СТАВОК!\n"
 					gameText += "🎯 Ставьте на победителя: /bet N СУММА\n"
-					gameText += "💎 Коэффициент: x10\n"
+					gameText += "💎 Коэффициент: x30\n"
 					gameText += "⏰ Время: 30 секунд\n"
 
 					// Отправляем начальное сообщение со ставками
@@ -1000,51 +1732,187 @@ func main() {
 					if err != nil {
 						log.Printf("Ошибка отправки начального сообщения: %v", err)
 						msg.Text = "🚫 Ошибка запуска игры!"
-						gameInProgress = false
 						break
 					}
 
+					// Очищаем канал отмены от предыдущих сигналов
+					select {
+					case <-gameCancel:
+						log.Printf("Команда /game: Очищен старый сигнал отмены")
+					default:
+						// Канал пуст
+					}
+
 					// Теперь устанавливаем флаги игры
-					isGameActive = true      // Устанавливаем после успешной отправки сообщения
-					bettingPhase = "initial" // Начинаем фазу ставок
+					isGameActive = true   // Устанавливаем после успешной отправки сообщения
+					gameInProgress = true // Помечаем, что процесс игры запущен
 
 					// Сохраняем ID сообщения для редактирования
 					gameMessageID = sentMsg.MessageID
 					totalRounds = len(participants) - 1
 					log.Printf("Игра запущена: chatID=%d, messageID=%d, totalRounds=%d", gameChatID, gameMessageID, totalRounds)
 
-					// Запускаем горутину для ожидания ставок и запуска игры
+					// Запускаем таймер на 30 секунд с возможностью отмены
 					go func() {
-						log.Printf("Горутина ставок: ждем 30 секунд для начальных ставок")
-						time.Sleep(30 * time.Second)
+						select {
+						case <-time.After(30 * time.Second):
+							// Таймер истек - запускаем игру
+							log.Printf("Горутина игры: Таймер истек, запускаем игру")
+							bettingPhase = "closed"
+							runGameSession(bot)
+							log.Printf("Горутина игры: runGameSession завершен")
 
-						// Закрываем фазу ставок
-						bettingPhase = "closed"
-						log.Printf("Горутина ставок: ставки закрыты, запускаем игру")
-
-						// Создаем новое сообщение для игры
-						gameMsg := tgbotapi.NewMessage(gameChatID, "🎮 ИГРА НАЧИНАЕТСЯ!\n⏰ До первого раунда: 3 сек")
-						sentGameMsg, err := bot.Send(gameMsg)
-						if err != nil {
-							log.Printf("Горутина ставок: Ошибка отправки сообщения игры: %v", err)
-							isGameActive = false
-							gameInProgress = false
+						case <-gameCancel:
+							// Игра была отменена через stopgame
+							log.Printf("Горутина игры: Игра отменена через stopgame")
 							return
 						}
-
-						// Сохраняем ID нового сообщения для редактирования результатов раундов
-						gameMessageID = sentGameMsg.MessageID
-						log.Printf("Горутина ставок: Создано новое сообщение для игры, messageID=%d", gameMessageID)
-
-						time.Sleep(3 * time.Second)
-
-						// Запускаем игру
-						runGameSession(bot)
 					}()
 
 					// Отправляем подтверждение запуска
-					msg.Text = "✅ Игра запущена! Делайте ставки в течение 30 секунд."
+					msg.Text = "✅ Игра запущена! У вас 30 секунд на ставки."
 					break
+
+				case "status":
+					statusText := fmt.Sprintf("📊 Статус бота:\n"+
+						"isGameActive: %t\n"+
+						"currentRound: %d\n"+
+						"bettingPhase: %s\n"+
+						"len(participants): %d\n"+
+						"len(initialBets): %d\n"+
+						"len(finalBets): %d\n"+
+						"currentPrize: %s (%s)",
+						isGameActive, currentRound, bettingPhase,
+						len(participants), len(initialBets), len(finalBets),
+						currentPrize.Name, currentPrize.Rarity)
+					msg.Text = statusText
+
+				case "reset":
+					log.Printf("Команда /reset: Вызвана пользователем %s", userName)
+
+					// Команда для полного сброса состояния и восстановления списка участников (только для администраторов)
+					if userName != "hunnidstooblue" && userName != "iamnothiding" {
+						log.Printf("Команда /reset: Отклонена - пользователь %s не администратор", userName)
+						msg.Text = "🚫 Только администраторы могут использовать эту команду!"
+						break
+					}
+
+					log.Printf("Команда /reset: Администратор %s подтвердил, выполняем сброс", userName)
+
+					// Полностью сбрасываем ВСЕ состояние
+					isGameActive = false
+					gameInProgress = false
+					currentRound = 0
+					bettingPhase = "closed"
+					currentPrize = Prize{}
+
+					// Очищаем все ставки
+					initialBets = make(map[string]Bet)
+					finalBets = make(map[string]Bet)
+					finalBettingNumbers = []int{}
+
+					// Восстанавливаем список участников из participantIDs
+					participants = make([]string, 0, len(participantIDs))
+					for name := range participantIDs {
+						participants = append(participants, name)
+					}
+					log.Printf("Команда /reset: Восстановлено %d участников: %v", len(participants), participants)
+
+					// Восстанавливаем хэши участников
+					participantHashes = make(map[string]string)
+					for name, username := range participantIDs {
+						participantHashes[name] = hashParticipant(username)
+					}
+					log.Printf("Команда /reset: Восстановлено %d хэшей участников", len(participantHashes))
+
+					// Очищаем канал отмены
+					select {
+					case <-gameCancel:
+						log.Printf("Команда /reset: Очищен сигнал отмены")
+					default:
+						// Канал пуст
+					}
+
+					msg.Text = fmt.Sprintf("🔄 Полный сброс состояния выполнен!\n✅ Восстановлено %d участников", len(participants))
+					log.Printf("Команда /reset: Успешно выполнена, отправляем сообщение: %s", msg.Text)
+
+				case "clearallinv":
+					log.Printf("Команда /clearallinv: Вызвана пользователем %s", userName)
+
+					// Команда для очистки всех инвентарей (только для администраторов)
+					if userName != "hunnidstooblue" && userName != "iamnothiding" {
+						log.Printf("Команда /clearallinv: Отклонена - пользователь %s не администратор", userName)
+						msg.Text = "🚫 Только администраторы могут использовать эту команду!"
+						break
+					}
+
+					log.Printf("Команда /clearallinv: Администратор %s подтвердил, очищаем все инвентари", userName)
+
+					if redisClient == nil {
+						log.Printf("Команда /clearallinv: Redis client not available")
+						msg.Text = "❌ Ошибка подключения к базе данных!"
+						break
+					}
+
+					ctx := context.Background()
+
+					// Ищем все ключи инвентаря
+					pattern := "inventory:*:*"
+					keys, err := redisClient.Keys(ctx, pattern).Result()
+					if err != nil {
+						log.Printf("Команда /clearallinv: Ошибка получения ключей инвентаря: %v", err)
+						msg.Text = "❌ Ошибка получения списка инвентарей!"
+						break
+					}
+
+					log.Printf("Команда /clearallinv: Найдено %d ключей инвентаря для удаления", len(keys))
+
+					if len(keys) == 0 {
+						msg.Text = "🧹 Все инвентари уже пусты!"
+						log.Printf("Команда /clearallinv: Инвентари уже пусты")
+						break
+					}
+
+					// Удаляем все ключи инвентаря
+					deletedCount, err := redisClient.Del(ctx, keys...).Result()
+					if err != nil {
+						log.Printf("Команда /clearallinv: Ошибка удаления инвентарей: %v", err)
+						msg.Text = "❌ Ошибка очистки инвентарей!"
+						break
+					}
+
+					log.Printf("Команда /clearallinv: Успешно удалено %d предметов из инвентарей", deletedCount)
+					msg.Text = fmt.Sprintf("🧹 Все инвентари очищены!\n✅ Удалено %d предметов у всех игроков", deletedCount)
+
+				case "setdefaultbalance":
+					log.Printf("Команда /setdefaultbalance: Вызвана пользователем %s", userName)
+
+					// Команда для установки баланса 1000 фишек всем игрокам (только для администраторов)
+					if userName != "hunnidstooblue" && userName != "iamnothiding" {
+						log.Printf("Команда /setdefaultbalance: Отклонена - пользователь %s не администратор", userName)
+						msg.Text = "🚫 Только администраторы могут использовать эту команду!"
+						break
+					}
+
+					log.Printf("Команда /setdefaultbalance: Администратор %s подтвердил, устанавливаем баланс 1000 всем игрокам", userName)
+
+					// Устанавливаем баланс 1000 для всех игроков
+					setCount := 0
+					for username := range participantIDs {
+						playerBalances[username] = 1000
+						setCount++
+						log.Printf("Команда /setdefaultbalance: Установлен баланс 1000 для игрока %s", username)
+					}
+
+					// Сохраняем балансы в Redis
+					if err := saveBalancesToRedis(); err != nil {
+						log.Printf("Команда /setdefaultbalance: Ошибка сохранения балансов в Redis: %v", err)
+						msg.Text = "❌ Ошибка сохранения балансов!"
+						break
+					}
+
+					log.Printf("Команда /setdefaultbalance: Успешно установлено 1000 фишек для %d игроков", setCount)
+					msg.Text = fmt.Sprintf("💰 Баланс сброшен!\n✅ Установлено 1000 фишек для %d игроков", setCount)
 
 				case "stopgame":
 					// Проверяем, является ли пользователь администратором
@@ -1053,13 +1921,35 @@ func main() {
 						break
 					}
 
+					log.Printf("Команда /stopgame: isGameActive=%t, gameInProgress=%t", isGameActive, gameInProgress)
 					if !isGameActive {
 						msg.Text = "🎮 Игра не запущена!"
 						break
 					}
 
+					// Отменяем активную горутину игры
+					select {
+					case gameCancel <- true:
+						log.Printf("Команда /stopgame: Отправлен сигнал отмены активной игре")
+					default:
+						log.Printf("Команда /stopgame: Нет активной горутины для отмены")
+					}
+
+					// Сбрасываем состояние игры
 					isGameActive = false
-					msg.Text = "🛑 Игра остановлена администратором!"
+					gameInProgress = false // Сбрасываем флаг процесса игры
+					bettingPhase = "closed"
+					currentRound = 0
+
+					// Очищаем ставки
+					initialBets = make(map[string]Bet)
+					finalBets = make(map[string]Bet)
+					finalBettingNumbers = []int{}
+
+					// Сбрасываем выбранную плашку
+					currentPrize = Prize{}
+
+					msg.Text = "🛑 Игра остановлена!"
 
 				case "start":
 					// Проверяем, является ли пользователь администратором
@@ -1069,7 +1959,7 @@ func main() {
 					}
 					msg.Text = fmt.Sprintf("привет долбоебы! сейчас будем решать кого удалить нахуй\nВсего участников: %d\n", len(participants))
 
-				case "reset":
+				case "restart":
 					// Проверяем, является ли пользователь администратором
 					if userName != "hunnidstooblue" && userName != "iamnothiding" {
 						msg.Text = "🚫 Только администраторы могут управлять игрой!"
@@ -1168,11 +2058,29 @@ func main() {
 					// Получаем аргументы команды
 					args := update.Message.CommandArguments()
 					if args == "" {
-						msg.Text = fmt.Sprintf("🎁 Текущая плашка: \"%s\"\nУкажите новую плашку! Пример: /setprize %s", currentPrize, currentPrize)
+						msg.Text = fmt.Sprintf("🎁 Текущая плашка: \"%s\" (%s редкость)\nУкажите ID или название плашки! Пример: /setprize chmo", currentPrize.Name, currentPrize.Rarity)
 					} else {
-						oldPrize := currentPrize
-						currentPrize = args
-						msg.Text = fmt.Sprintf("🎁 Плашка изменена!\nБыло: \"%s\"\nСтало: \"%s\"", oldPrize, currentPrize)
+						// Ищем плашку по ID или названию
+						found := false
+						for _, prize := range prizes {
+							if prize.ID == args || prize.Name == args {
+								oldPrize := currentPrize
+								currentPrize = prize
+								msg.Text = fmt.Sprintf("🎁 Плашка изменена!\nБыло: \"%s\" (%s)\nСтало: \"%s\" (%s)", oldPrize.Name, oldPrize.Rarity, currentPrize.Name, currentPrize.Rarity)
+								found = true
+								break
+							}
+						}
+						if !found {
+							availablePrizes := ""
+							for i, prize := range prizes {
+								if i > 0 {
+									availablePrizes += ", "
+								}
+								availablePrizes += fmt.Sprintf("%s (%s)", prize.ID, prize.Name)
+							}
+							msg.Text = fmt.Sprintf("🚫 Плашка '%s' не найдена!\nДоступные плашки: %s", args, availablePrizes)
+						}
 					}
 
 				case "poll":
@@ -1189,13 +2097,13 @@ func main() {
 						// Определяем вопрос в зависимости от количества участников
 						question := "🎯 Кто следующий участник?"
 						if len(participants) == 2 {
-							question = fmt.Sprintf("🏆 Кто получит плашку \"%s\"?", currentPrize)
+							question = fmt.Sprintf("🏆 Кто получит плашку \"%s\"?", currentPrize.Name)
 						}
 
 						// Создаем poll
 						pollOptions := make([]string, len(participants))
 						for i, participant := range participants {
-							pollOptions[i] = formatParticipantNameWithUsername(participant)
+							pollOptions[i] = formatParticipantNameWithItem(participant)
 						}
 						poll := tgbotapi.SendPollConfig{
 							BaseChat: tgbotapi.BaseChat{
@@ -1212,7 +2120,16 @@ func main() {
 					}
 
 				case "prize":
-					msg.Text = fmt.Sprintf("🎁 Текущая плашка для проигравшего: \"%s\"", currentPrize)
+					rarityText := ""
+					switch currentPrize.Rarity {
+					case "common":
+						rarityText = "ОБЫЧНАЯ"
+					case "rare":
+						rarityText = "РЕДКАЯ"
+					case "legendary":
+						rarityText = "ЛЕГЕНДАРНАЯ"
+					}
+					msg.Text = fmt.Sprintf("🎁 В этой игре будет разыграна %s плашка для победителя!", rarityText)
 
 				case "balance":
 					userName := update.Message.From.UserName
@@ -1299,6 +2216,75 @@ func main() {
 						}
 					}
 
+				case "pay":
+					log.Printf("Команда /pay от %s", userName)
+					args := update.Message.CommandArguments()
+					if args == "" {
+						msg.Text = "🚫 Укажите получателя и сумму! Пример: /pay @username 500"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					parts := strings.Split(args, " ")
+					if len(parts) < 2 {
+						msg.Text = "🚫 Укажите получателя и сумму через пробел! Пример: /pay @username 500"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					recipientUsername := strings.TrimPrefix(strings.TrimSpace(parts[0]), "@")
+					amountStr := strings.TrimSpace(parts[1])
+
+					amount, err := strconv.Atoi(amountStr)
+					if err != nil || amount <= 0 {
+						msg.Text = "🚫 Укажите корректную положительную сумму!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем, что получатель существует
+					if _, exists := playerBalances[recipientUsername]; !exists {
+						msg.Text = fmt.Sprintf("🚫 Пользователь @%s не найден в списке участников!", recipientUsername)
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем, что не переводим себе
+					if recipientUsername == userName {
+						msg.Text = "🚫 Нельзя переводить фишки самому себе!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Проверяем баланс отправителя
+					senderBalance, exists := playerBalances[userName]
+					if !exists || senderBalance < amount {
+						msg.Text = fmt.Sprintf("🚫 Недостаточно средств! Ваш баланс: %d %s",
+							senderBalance, getChipsWord(senderBalance))
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Выполняем перевод
+					if !changeBalance(userName, -amount) {
+						msg.Text = "🚫 Ошибка при списании средств!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					if !changeBalance(recipientUsername, amount) {
+						// Возвращаем фишки отправителю в случае ошибки
+						changeBalance(userName, amount)
+						msg.Text = "🚫 Ошибка при зачислении средств получателю!"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					log.Printf("Команда /pay: %s перевел %d фишек пользователю %s", userName, amount, recipientUsername)
+					msg.Text = fmt.Sprintf("✅ Успешно переведено %d %s пользователю @%s!\n💰 Ваш баланс: %d %s",
+						amount, getChipsWord(amount), recipientUsername, playerBalances[userName], getChipsWord(playerBalances[userName]))
+					msg.ReplyToMessageID = update.Message.MessageID
+
 				case "debug":
 					// Проверяем, является ли пользователь администратором
 					if userName != "hunnidstooblue" && userName != "iamnothiding" {
@@ -1340,9 +2326,222 @@ func main() {
 					} else {
 						msg.Text = fmt.Sprintf("🎮 ТЕКУЩИЕ УЧАСТНИКИ ИГРЫ (%d):\n", len(participants))
 						for i, participant := range participants {
-							msg.Text += fmt.Sprintf("\n%d. %s", i+1, formatParticipantNameWithUsername(participant))
+							msg.Text += fmt.Sprintf("\n%d. %s", i+1, formatParticipantNameWithItem(participant))
 						}
 					}
+
+				case "leaderboard":
+					log.Printf("Команда /leaderboard от %s", userName)
+					log.Printf("Команда /leaderboard: participantIDs содержит %d участников", len(participantIDs))
+
+					// Создаем карту стоимости инвентаря и списка предметов для каждого игрока
+					inventoryValues := make(map[string]int)
+					inventoryItems := make(map[string][]InventoryItem)
+
+					// Для каждого участника считаем стоимость его инвентаря
+					for participantName, username := range participantIDs {
+						log.Printf("Команда /leaderboard: обрабатываем участника %s (username: %s)", participantName, username)
+						inventory, err := getPlayerInventory(username)
+						if err != nil {
+							log.Printf("Ошибка получения инвентаря для %s: %v", username, err)
+							continue
+						}
+
+						totalValue := 0
+						for _, item := range inventory {
+							totalValue += item.Cost
+							log.Printf("Команда /leaderboard: предмет %s стоит %d, итого %d", item.PrizeName, item.Cost, totalValue)
+						}
+						inventoryValues[username] = totalValue
+						inventoryItems[username] = inventory
+						log.Printf("Команда /leaderboard: участник %s имеет стоимость инвентаря %d", participantName, totalValue)
+					}
+
+					log.Printf("Команда /leaderboard: собрано данных для %d участников", len(inventoryValues))
+
+					// Создаем слайс для сортировки
+					type playerValue struct {
+						username string
+						value    int
+					}
+
+					var players []playerValue
+					for username, value := range inventoryValues {
+						players = append(players, playerValue{username: username, value: value})
+					}
+
+					// Фильтруем игроков с нулевой стоимостью инвентаря
+					var filteredPlayers []playerValue
+					for _, player := range players {
+						if player.value > 0 {
+							filteredPlayers = append(filteredPlayers, player)
+						}
+					}
+
+					log.Printf("Команда /leaderboard: после фильтрации осталось %d игроков с инвентарем", len(filteredPlayers))
+
+					// Проверяем, есть ли игроки с инвентарем
+					if len(filteredPlayers) == 0 {
+						log.Printf("Команда /leaderboard: все игроки бомжи, показываем соответствующее сообщение")
+						msg.Text = "🏆 ДОСКA ЛИДЕРОВ ПО СТОИМОСТИ ИНВЕНТАРЯ 🏆\n\n💸 Все бомжи! Никто не имеет ценных плашек."
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					// Сортируем по убыванию стоимости
+					for i := 0; i < len(filteredPlayers)-1; i++ {
+						for j := i + 1; j < len(filteredPlayers); j++ {
+							if filteredPlayers[i].value < filteredPlayers[j].value {
+								filteredPlayers[i], filteredPlayers[j] = filteredPlayers[j], filteredPlayers[i]
+							}
+						}
+					}
+
+					log.Printf("Команда /leaderboard: сортировка завершена, топ игрок: %s с %d фишками", filteredPlayers[0].username, filteredPlayers[0].value)
+
+					// Формируем сообщение
+					msg.Text = "🏆 ДОСКA ЛИДЕРОВ ПО СТОИМОСТИ ИНВЕНТАРЯ 🏆\n\n"
+
+					for i, player := range filteredPlayers {
+						if i >= 10 { // Показываем только топ-10
+							break
+						}
+
+						// Получаем имя участника по username
+						participantName := getParticipantNameByUsername(player.username)
+
+						// Получаем надетую плашку для отображения
+						wornItem := ""
+						if wornData, err := getWornItem(player.username); err == nil && wornData != nil {
+							wornItem = " " + wornData["name"]
+						}
+
+						emoji := ""
+						switch i {
+						case 0:
+							emoji = "🥇"
+						case 1:
+							emoji = "🥈"
+						case 2:
+							emoji = "🥉"
+						default:
+							emoji = fmt.Sprintf("%d.", i+1)
+						}
+
+						msg.Text += fmt.Sprintf("%s %s%s\n", emoji, participantName, wornItem)
+
+						// Показываем список предметов
+						playerItems := inventoryItems[player.username]
+						if len(playerItems) > 0 {
+							// Группируем предметы по имени для краткости
+							itemCounts := make(map[string]int)
+							for _, item := range playerItems {
+								itemCounts[item.PrizeName]++
+							}
+
+							itemList := ""
+							for itemName, count := range itemCounts {
+								if itemList != "" {
+									itemList += ", "
+								}
+								if count > 1 {
+									itemList += fmt.Sprintf("%s x%d", itemName, count)
+								} else {
+									itemList += itemName
+								}
+							}
+
+							msg.Text += fmt.Sprintf("   📦 %s\n", itemList)
+						} else {
+							msg.Text += "   📦 Пусто\n"
+						}
+
+						msg.Text += fmt.Sprintf("   💰 Стоимость: %d фишек\n\n", player.value)
+					}
+
+					// Добавляем информацию о текущем игроке, если он не в топ-10
+					currentPlayerValue := inventoryValues[userName]
+
+					// Ищем позицию текущего игрока среди отфильтрованных игроков
+					currentRank := -1
+					for i, player := range filteredPlayers {
+						if player.username == userName {
+							currentRank = i + 1
+							break
+						}
+					}
+
+					// Показываем позицию игрока только если у него есть инвентарь
+					if currentPlayerValue > 0 && (currentRank > 10 || currentRank == -1) {
+						participantName := getParticipantNameByUsername(userName)
+						wornItem := ""
+						if wornData, err := getWornItem(userName); err == nil && wornData != nil {
+							wornItem = " " + wornData["name"]
+						}
+
+						if currentRank == -1 {
+							msg.Text += fmt.Sprintf("\n\nТвоя позиция:\n%s%s\n", participantName, wornItem)
+
+							// Показываем список предметов игрока
+							playerItems := inventoryItems[userName]
+							if len(playerItems) > 0 {
+								itemCounts := make(map[string]int)
+								for _, item := range playerItems {
+									itemCounts[item.PrizeName]++
+								}
+
+								itemList := ""
+								for itemName, count := range itemCounts {
+									if itemList != "" {
+										itemList += ", "
+									}
+									if count > 1 {
+										itemList += fmt.Sprintf("%s x%d", itemName, count)
+									} else {
+										itemList += itemName
+									}
+								}
+
+								msg.Text += fmt.Sprintf("   📦 %s\n", itemList)
+							} else {
+								msg.Text += "   📦 Пусто\n"
+							}
+
+							msg.Text += fmt.Sprintf("   💰 Стоимость: %d фишек", currentPlayerValue)
+						} else {
+							msg.Text += fmt.Sprintf("\n\n%d. %s%s\n", currentRank, participantName, wornItem)
+
+							// Показываем список предметов игрока
+							playerItems := inventoryItems[userName]
+							if len(playerItems) > 0 {
+								itemCounts := make(map[string]int)
+								for _, item := range playerItems {
+									itemCounts[item.PrizeName]++
+								}
+
+								itemList := ""
+								for itemName, count := range itemCounts {
+									if itemList != "" {
+										itemList += ", "
+									}
+									if count > 1 {
+										itemList += fmt.Sprintf("%s x%d", itemName, count)
+									} else {
+										itemList += itemName
+									}
+								}
+
+								msg.Text += fmt.Sprintf("   📦 %s\n", itemList)
+							} else {
+								msg.Text += "   📦 Пусто\n"
+							}
+
+							msg.Text += fmt.Sprintf("   💰 Стоимость: %d фишек (ты)", currentPlayerValue)
+						}
+					}
+
+					// Отвечаем на сообщение пользователя
+					msg.ReplyToMessageID = update.Message.MessageID
 
 				case "help":
 					msg.Text = "ты совсем долбоеб? ты не знаешь команд???\n\n" +
@@ -1351,20 +2550,247 @@ func main() {
 						"/game - начать автоматическую игру с таймером\n" +
 						"/stopgame - остановить текущую игру\n" +
 						"/list - список активных участников\n" +
-						"/prize - показать плашку\n\n" +
+						"/prize - показать плашку\n" +
+						"/leaderboard - доска лидеров по стоимости инвентаря\n\n" +
 						"💰 ЭКОНОМИКА:\n" +
 						"/balance - посмотреть свой баланс\n" +
-						"/bet (хэш сумма) - сделать ставку на участника\n\n" +
+						"/inv - посмотреть свой инвентарь плашек\n" +
+						"/sell (хэш) - продать плашку\n" +
+						"/wear (хэш) - надеть плашку\n" +
+						"/unwear - снять плашку\n" +
+						"/pay (@username сумма) - перевести фишки другому игроку\n" +
+						"/bet (номер сумма) - сделать ставку на участника\n" +
+						"/bet (номер all) - поставить все деньги\n\n" +
 						"👑 АДМИНИСТРАТОРСКИЕ КОМАНДЫ:\n" +
 						"/add (Имя Фамилия username) - добавить участника\n" +
 						"/remove (Имя Фамилия) - удалить участника\n" +
-						"/setprize (текст) - изменить плашку\n" +
+						"/setprize (ID плашки) - установить плашку для игры\n" +
+						"/loadfromfile - загрузить призы из prizes.json в Redis\n" +
+						"/removefromredis - удалить все призы из Redis\n" +
+						"/clearallinv - очистить инвентари всех игроков\n" +
+						"/setdefaultbalance - установить всем игрокам баланс 1000 фишек\n" +
 						"/poll - голосование\n" +
 						"/givefunds (@username сумма) - дать деньги игроку\n" +
 						"/withdrawfunds (@username сумма) - снять деньги у игрока\n" +
 						"/debug - отладочная информация\n" +
 						"/promote (ID) - повысить до администратора\n\n" +
 						"это все что тебе надо"
+				case "inv":
+					log.Printf("Команда /inv: Вызвана пользователем %s", userName)
+
+					// Показать инвентарь игрока
+					inventory, err := getPlayerInventory(userName)
+					if err != nil {
+						log.Printf("Команда /inv: Ошибка загрузки инвентаря: %v", err)
+						msg.Text = fmt.Sprintf("❌ Ошибка загрузки инвентаря: %v", err)
+					} else if len(inventory) == 0 {
+						log.Printf("Команда /inv: Инвентарь пользователя %s пуст", userName)
+						msg.Text = fmt.Sprintf("🎒 Инвентарь @%s:\n\n📦 Ваш инвентарь пуст", userName)
+					} else {
+						log.Printf("Команда /inv: Найдено %d предметов в инвентаре пользователя %s", len(inventory), userName)
+						msg.Text = fmt.Sprintf("🎒 Инвентарь @%s:\n", userName)
+						totalValue := 0
+
+						// Группируем по редкости для красивого отображения
+						commonItems := []InventoryItem{}
+						rareItems := []InventoryItem{}
+						legendaryItems := []InventoryItem{}
+
+						for _, item := range inventory {
+							totalValue += item.Cost * item.Count
+							switch item.Rarity {
+							case "common":
+								commonItems = append(commonItems, item)
+							case "rare":
+								rareItems = append(rareItems, item)
+							case "legendary":
+								legendaryItems = append(legendaryItems, item)
+							}
+						}
+
+						// Показываем по редкостям
+						if len(legendaryItems) > 0 {
+							msg.Text += "\n🔥 **ЛЕГЕНДАРНЫЕ:**\n"
+							for _, item := range legendaryItems {
+								msg.Text += fmt.Sprintf("  %s [хэш: %s] (%d фишек) - /sell %s\n",
+									item.PrizeName, item.Hash, item.Cost, item.Hash)
+							}
+						}
+
+						if len(rareItems) > 0 {
+							msg.Text += "\n💎 **РЕДКИЕ:**\n"
+							for _, item := range rareItems {
+								msg.Text += fmt.Sprintf("  %s [хэш: %s] (%d фишек) - /sell %s\n",
+									item.PrizeName, item.Hash, item.Cost, item.Hash)
+							}
+						}
+
+						if len(commonItems) > 0 {
+							msg.Text += "\n⚪ **ОБЫЧНЫЕ:**\n"
+							for _, item := range commonItems {
+								msg.Text += fmt.Sprintf("  %s [хэш: %s] (%d фишек) - /sell %s\n",
+									item.PrizeName, item.Hash, item.Cost, item.Hash)
+							}
+						}
+
+						msg.Text += fmt.Sprintf("\n💰 Общая стоимость инвентаря: %d фишек", totalValue)
+						msg.Text += "\n\n💡 Для продажи предмета используйте: /sell <хэш>"
+						msg.Text += "\n💡 Для надевания плашки: /wear <хэш>"
+						msg.Text += "\n💡 Для снятия плашки: /unwear"
+						log.Printf("Команда /inv: Успешно сформирован инвентарь для пользователя %s, длина сообщения: %d", userName, len(msg.Text))
+					}
+
+					// Отвечаем на сообщение пользователя
+					msg.ReplyToMessageID = update.Message.MessageID
+
+				case "sell":
+					log.Printf("Команда /sell от %s", userName)
+					args := update.Message.CommandArguments()
+					if args == "" {
+						msg.Text = "🚫 Укажите хэш предмета для продажи! Пример: /sell abc123def456"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					itemHash := strings.TrimSpace(args)
+					log.Printf("Команда /sell: Попытка продажи предмета с хэшем %s пользователем %s", itemHash, userName)
+
+					// Ищем предмет в инвентаре пользователя
+					ctx := context.Background()
+					key := fmt.Sprintf("inventory:%s:%s", userName, itemHash)
+
+					val, err := redisClient.Get(ctx, key).Result()
+					if err != nil {
+						log.Printf("Команда /sell: Предмет с хэшем %s не найден у пользователя %s", itemHash, userName)
+						msg.Text = "❌ Предмет с таким хэшем не найден в вашем инвентаре!"
+						break
+					}
+
+					// Парсим предмет
+					var item InventoryItem
+					err = json.Unmarshal([]byte(val), &item)
+					if err != nil {
+						log.Printf("Команда /sell: Ошибка парсинга предмета %s: %v", itemHash, err)
+						msg.Text = "❌ Ошибка обработки предмета!"
+						break
+					}
+
+					// Проверяем, не надет ли этот предмет на игроке
+					wornData, wornErr := getWornItem(userName)
+					itemWasWorn := false
+					if wornErr == nil && wornData != nil && wornData["hash"] == itemHash {
+						// Предмет надет - автоматически снимаем
+						unwearErr := unwearItem(userName)
+						if unwearErr != nil {
+							log.Printf("Команда /sell: Ошибка автоматического снятия плашки: %v", unwearErr)
+						} else {
+							log.Printf("Команда /sell: Плашка %s автоматически снята с игрока %s", item.PrizeName, userName)
+							itemWasWorn = true
+						}
+					}
+
+					// Удаляем предмет из инвентаря
+					err = redisClient.Del(ctx, key).Err()
+					if err != nil {
+						log.Printf("Команда /sell: Ошибка удаления предмета %s: %v", itemHash, err)
+						msg.Text = "❌ Ошибка удаления предмета!"
+						break
+					}
+
+					// Начисляем деньги игроку
+					changeBalance(userName, item.Cost)
+
+					log.Printf("Команда /sell: Предмет %s продан за %d фишек пользователем %s", item.PrizeName, item.Cost, userName)
+
+					// Формируем сообщение
+					msg.Text = fmt.Sprintf("✅ Предмет \"%s\" продан за %d фишек!", item.PrizeName, item.Cost)
+					if itemWasWorn {
+						msg.Text += "\n👕 Плашка автоматически снята с вашего имени!"
+					}
+					msg.Text += fmt.Sprintf("\n💰 Ваш баланс: %d фишек", playerBalances[userName])
+
+					// Отвечаем на сообщение пользователя
+					msg.ReplyToMessageID = update.Message.MessageID
+
+				case "wear":
+					log.Printf("Команда /wear от %s", userName)
+					args := update.Message.CommandArguments()
+					if args == "" {
+						msg.Text = "🚫 Укажите хэш предмета для надевания! Пример: /wear abc123"
+						msg.ReplyToMessageID = update.Message.MessageID
+						break
+					}
+
+					itemHash := strings.TrimSpace(args)
+					log.Printf("Команда /wear: Попытка надеть предмет с хэшем %s пользователем %s", itemHash, userName)
+
+					// Сначала снимаем текущую плашку, если она есть
+					unwearErr := unwearItem(userName)
+					if unwearErr != nil && unwearErr.Error() != "нет надетой плашки" {
+						log.Printf("Команда /wear: Ошибка снятия предыдущей плашки: %v", unwearErr)
+					}
+
+					// Надеваем новую плашку
+					err := wearItem(userName, itemHash)
+					if err != nil {
+						log.Printf("Команда /wear: Ошибка надевания плашки %s: %v", itemHash, err)
+						msg.Text = fmt.Sprintf("❌ %s", err.Error())
+						break
+					}
+
+					// Получаем информацию о надетой плашке для отображения
+					wornData, _ := getWornItem(userName)
+					if wornData != nil {
+						msg.Text = fmt.Sprintf("✅ Плашка \"%s\" надета!\nТеперь ваше имя отображается как: %s",
+							wornData["name"], formatParticipantNameWithUsername(getParticipantNameByUsername(userName)))
+					} else {
+						msg.Text = "✅ Плашка надета!"
+					}
+
+					// Отвечаем на сообщение пользователя
+					msg.ReplyToMessageID = update.Message.MessageID
+
+				case "unwear":
+					log.Printf("Команда /unwear от %s", userName)
+
+					err := unwearItem(userName)
+					if err != nil {
+						log.Printf("Команда /unwear: Ошибка снятия плашки: %v", err)
+						msg.Text = fmt.Sprintf("❌ %s", err.Error())
+						break
+					}
+
+					msg.Text = "✅ Плашка снята!"
+
+					// Отвечаем на сообщение пользователя
+					msg.ReplyToMessageID = update.Message.MessageID
+
+				case "loadfromfile":
+					// Проверяем, является ли пользователь администратором
+					if userName != "hunnidstooblue" && userName != "iamnothiding" {
+						msg.Text = "🚫 Только администраторы могут загружать призы!"
+						break
+					}
+
+					if err := loadPrizesFromFileToRedis(); err != nil {
+						msg.Text = fmt.Sprintf("❌ Ошибка загрузки призов: %v", err)
+					} else {
+						msg.Text = "✅ Призы успешно загружены из prizes.json в Redis!"
+					}
+
+				case "removefromredis":
+					// Проверяем, является ли пользователь администратором
+					if userName != "hunnidstooblue" && userName != "iamnothiding" {
+						msg.Text = "🚫 Только администраторы могут удалять призы!"
+						break
+					}
+
+					if err := removeAllPrizesFromRedis(); err != nil {
+						msg.Text = fmt.Sprintf("❌ Ошибка удаления призов: %v", err)
+					} else {
+						msg.Text = "✅ Все призы удалены из Redis!"
+					}
+
 				case "promote":
 					// Проверяем, является ли пользователь администратором
 					if userName != "hunnidstooblue" && userName != "iamnothiding" {
